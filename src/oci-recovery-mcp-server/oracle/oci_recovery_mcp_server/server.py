@@ -104,7 +104,8 @@ if _ENV_FILE:
     load_dotenv(_ENV_FILE, override=False)
 
 """MCP tools available in this server:
-- list_subscribed_regions
+- get_compartment_by_name_tool
+- fetch_regions_subscribed
 - list_protected_databases
 - get_protected_database
 - summarize_protected_database_health
@@ -113,6 +114,8 @@ if _ENV_FILE:
 - check_recovery_service_limits
 - list_protection_policies
 - get_protection_policy
+- list_recovery_service_subnets
+- get_recovery_service_subnet
 - get_recovery_service_metrics
 - list_databases
 - get_database
@@ -120,9 +123,13 @@ if _ENV_FILE:
 - get_backup
 - list_restore
 - summarize_protected_database_backup_destination
+- list_db_homes
 - get_db_home
 - list_db_systems
 - get_db_system
+- oci_recovery_service_dashboard_prompt
+- onboard_database_with_cloud_protect
+- OutofplaceRestoreOfDatabase
 """
 
 OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT = """

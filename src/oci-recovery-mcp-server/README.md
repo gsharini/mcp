@@ -1,11 +1,15 @@
 # OCI Recovery Service MCP Server
 
-OCI Model Context Protocol (MCP) server exposing Oracle Cloud Recovery Service operations as MCP tools.
+OCI Model Context Protocol (MCP) server exposing read-oriented Oracle Cloud Recovery Service and Database Service operations as MCP tools.
 
 ## Features
 
-- List Protected Databases with rich filtering (compartment, lifecycle_state, display_name, id, protection_policy_id, recovery_service_subnet_id, limit, page, sort_order, sort_by, opc_request_id, region).
-- Mapping of OCI SDK models to Pydantic for safe, serializable responses.
+- Browse protected databases, protection policies, Recovery Service subnets, restore work requests, Database Service resources, and backups.
+- Summarize protected-database health, redo-shipping status, backup space, and backup destinations.
+- Optionally traverse child compartments for supported list and summary tools.
+- Use multi-tenant OAuth for hosted deployments, with tenancy selection and per-tenant OCI request routing.
+- Retrieve non-destructive guidance for Recovery Service dashboards, Cloud Protect onboarding, and CDB out-of-place restore planning.
+- Map OCI SDK models to Pydantic models for safe, serializable responses.
 
 ## MCP client configuration (recommended)
 
@@ -30,21 +34,25 @@ Add a stanza like this to your MCP client config (often called `mcp.json`; examp
 }
 ```
 
-For HTTP transport, start the server with:
+For local API-key or session-token HTTP transport, start the server with:
 
 ```sh
 ORACLE_MCP_HOST=<bind_host> \
 ORACLE_MCP_PORT=<port> \
 ORACLE_MCP_BASE_URL=<public_base_url> \
-OCI_REGION=<region> \
-IDCS_DOMAIN=<idcs_domain> \
-IDCS_CLIENT_ID=<client_id> \
-IDCS_CLIENT_SECRET=<client_secret> \
-IDCS_AUDIENCE=<audience> \
+ORACLE_MCP_AUTH_METHOD=session \
 uvx oracle.oci-recovery-mcp-server
 ```
 
-Register `${ORACLE_MCP_BASE_URL}/auth/callback` in the OCI IAM confidential application. If `IDCS_REQUIRED_SCOPES` is unset, the default is `openid profile email oci_mcp.recovery.invoke`. `stdio` uses the configured OCI CLI profile; HTTP uses the authenticated OCI IAM user.
+`stdio` uses the configured OCI CLI profile. Set `ORACLE_MCP_AUTH_METHOD=apikey` to use API-key authentication from that profile.
+
+### Hosted multi-tenant OAuth
+
+Set `ORACLE_MCP_AUTH_METHOD=oauth` and provide a server-side tenancy registry through `ORACLE_MCP_TENANCY_REGISTRY`. Each tenancy entry supplies its tenancy OCID, IAM domain, confidential-client credentials, and region. Configure clients to send `X-OCI-Tenancy` with a registered tenancy alias or OCID; this header selects the tenancy for sign-in and requests.
+
+The registry, client secrets, and OAuth state remain server-side. The legacy single-tenant variables (`ORACLE_MCP_IDCS_DOMAIN`, `ORACLE_MCP_IDCS_CLIENT_ID`, `ORACLE_MCP_IDCS_CLIENT_SECRET`, `ORACLE_MCP_TENANCY_ID`, and `ORACLE_MCP_REGION`) remain supported when no registry is configured.
+
+The server optionally loads a `.env` file before reading configuration. Set `ORACLE_MCP_ENV_FILE` to select a specific file; explicitly exported environment variables take precedence.
 
 ## Install
 
@@ -65,26 +73,39 @@ uv pip install .
 
 ## Tools
 
-- get_compartment_by_name_tool(name) -> str
-- list_protected_databases(compartment_id, lifecycle_state=None, display_name=None, id=None, protection_policy_id=None, recovery_service_subnet_id=None, limit=None, page=None, sort_order=None, sort_by=None, opc_request_id=None, region=None) -> list[ProtectedDatabaseSummary]
-- get_protected_database(protected_database_id, opc_request_id=None, region=None) -> ProtectedDatabase
-- summarize_protected_database_health(compartment_id=None, region=None) -> ProtectedDatabaseHealthCounts
-- summarize_protected_database_redo_status(compartment_id=None, region=None) -> ProtectedDatabaseRedoCounts
-- summarize_backup_space_used(compartment_id=None, region=None) -> ProtectedDatabaseBackupSpaceSum
-- list_protection_policies(compartment_id, lifecycle_state=None, display_name=None, id=None, limit=None, page=None, sort_order=None, sort_by=None, opc_request_id=None, region=None) -> list[ProtectionPolicySummary]
-- get_protection_policy(protection_policy_id, opc_request_id=None, region=None) -> ProtectionPolicy
-- list_recovery_service_subnets(compartment_id, lifecycle_state=None, display_name=None, id=None, vcn_id=None, limit=None, page=None, sort_order=None, sort_by=None, opc_request_id=None, region=None) -> list[RecoveryServiceSubnetSummary]
-- get_recovery_service_subnet(recovery_service_subnet_id, opc_request_id=None, region=None) -> RecoveryServiceSubnet
-- get_recovery_service_metrics(compartment_id, start_time, end_time, metricName="SpaceUsedForRecoveryWindow", resolution="1h", aggregation="max", protected_database_id=None) -> list[dict]
-- list_databases(compartment_id=None, db_home_id=None, system_id=None, limit=None, page=None, sort_by=None, sort_order=None, lifecycle_state=None, db_name=None, region=None) -> list[DatabaseSummary]
-- get_database(database_id, region=None) -> Database
-- list_backups(compartment_id=None, database_id=None, lifecycle_state=None, type=None, limit=None, page=None, region=None) -> list[BackupSummary]
-- get_backup(backup_id, region=None) -> Backup
-- list_restore(compartment_id, fetch_for_child_compartment=False, resource_id=None, status=None, limit=None, page=None, sort_order=None, sort_by=None, opc_request_id=None, region=None, aggregate_pages=True) -> list[WorkRequest]
-- summarize_protected_database_backup_destination(compartment_id=None, region=None, db_home_id=None, include_last_backup_time=False) -> ProtectedDatabaseBackupDestinationSummary
-- get_db_home(db_home_id, region=None) -> DatabaseHome
-- list_db_systems(compartment_id=None, lifecycle_state=None, limit=None, page=None, region=None) -> list[DbSystemSummary]
-- get_db_system(db_system_id, region=None) -> DbSystem
+All tools support an optional `region` parameter where applicable. Tools marked with **child-compartment support** accept `fetch_for_child_compartment=true` to aggregate results across the requested compartment subtree.
+
+### Tenancy and compartments
+
+- `get_compartment_by_name_tool(name)` — resolve an accessible compartment by display name.
+- `fetch_regions_subscribed(tenancy_id=None)` — list the tenancy's subscribed OCI regions and status.
+
+### Recovery Service
+
+- `list_protected_databases(...)` — list protected databases with filters, subnet details, metrics, retention-lock status, and redo-shipping status. **Child-compartment support.**
+- `get_protected_database(protected_database_id, ...)` — retrieve one protected database.
+- `summarize_protected_database_health(...)` — summarize protected-database health states. **Child-compartment support.**
+- `summarize_protected_database_redo_status(...)` — summarize real-time redo shipping status. **Child-compartment support.**
+- `summarize_backup_space_used(...)` — summarize backup space used by eligible protected databases. **Child-compartment support.**
+- `check_recovery_service_limits(...)` — retrieve Recovery Service quota availability for the authenticated tenancy.
+- `list_protection_policies(...)` and `get_protection_policy(protection_policy_id, ...)` — browse protection policies. `list_protection_policies` supports child compartments.
+- `list_recovery_service_subnets(...)` and `get_recovery_service_subnet(recovery_service_subnet_id, ...)` — browse Recovery Service subnets. `list_recovery_service_subnets` supports child compartments.
+- `get_recovery_service_metrics(compartment_id, start_time, end_time, ...)` — retrieve Recovery Service metric time series. **Child-compartment support.**
+- `list_restore(compartment_id, ...)` — list active and historical database restore work requests. **Child-compartment support.**
+
+### Database Service and backups
+
+- `list_databases(...)` and `get_database(database_id, ...)` — browse databases and their backup configuration. `list_databases` supports child compartments.
+- `list_db_homes(...)` and `get_db_home(db_home_id, ...)` — browse database homes. `list_db_homes` supports child compartments.
+- `list_db_systems(...)` and `get_db_system(db_system_id, ...)` — browse database systems. `list_db_systems` supports child compartments.
+- `list_backups(...)` and `get_backup(backup_id, ...)` — browse manual, automatic, and long-term backups. `list_backups` supports child compartments.
+- `summarize_protected_database_backup_destination(...)` — summarize backup destinations and configuration status. **Child-compartment support.**
+
+### Guidance
+
+- `oci_recovery_service_dashboard_prompt()` — return dashboard-generation guidance for Recovery Service data.
+- `onboard_database_with_cloud_protect()` — return non-destructive Cloud Protect onboarding readiness guidance.
+- `OutofplaceRestoreOfDatabase(source_database_name, target_database_address, protected_database_ocid, ...)` — return a populated CDB out-of-place restore runbook without performing recovery operations.
 
 ## Development
 
