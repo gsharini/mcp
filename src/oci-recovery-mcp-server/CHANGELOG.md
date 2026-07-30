@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Ported multi-tenant OAuth authentication, Cloud Protect onboarding guidance, and out-of-place restore guidance from the recovery reference server.
+- Expanded the unit suite for authentication, tenancy registry, guidance, and read-only recovery operations.
+
 ## 2.1.0
 
 ### Added

@@ -8,7 +8,7 @@ https://oss.oracle.com/licenses/upl.
 # This file defines the FastMCP server for Oracle Recovery Service related tools.
 # It wires up:
 # - Logging (file + optional console with rotation)
-# - OCI client factories (Recovery, Identity, Database, Monitoring)
+# - OCI client factories (Recovery, Identity, Database, Monitoring, Limits)
 # - Helper utilities (tenancy/compartment discovery, DB Home discovery)
 # - A set of MCP tools (decorated functions) that call OCI SDKs, paginate responses,
 #   and map SDK models into server-specific dataclasses found in models.py.
@@ -31,10 +31,12 @@ https://oss.oracle.com/licenses/upl.
 #   wherever possible, especially for pagination and nested model fields.
 # - We log key milestones and counts for better operability and diagnostics.
 
-import configparser
+import ipaddress
 import json
 import logging
 import os
+import re
+import threading
 import time
 import traceback
 import uuid
@@ -42,10 +44,8 @@ from logging.handlers import RotatingFileHandler
 from typing import Annotated, Any, Callable, Literal, Optional
 
 import oci
+from dotenv import find_dotenv, load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.oci import OCIProvider
-from fastmcp.server.dependencies import get_access_token
-from fastmcp.utilities.auth import parse_scopes
 from oci.monitoring.models import SummarizeMetricsDataDetails
 
 # Database Service models and mappers
@@ -58,7 +58,6 @@ from oracle.oci_recovery_mcp_server.models import (
     DatabaseSummary,
     DbSystem,
     DbSystemSummary,
-    WorkRequest,
     ProtectedDatabase,
     ProtectedDatabaseBackupDestinationItem,
     ProtectedDatabaseBackupDestinationSummary,
@@ -68,6 +67,7 @@ from oracle.oci_recovery_mcp_server.models import (
     ProtectedDatabaseSummary,
     ProtectionPolicy,
     RecoveryServiceSubnet,
+    WorkRequest,
     map_backup,
     map_backup_summary,
     map_database,
@@ -77,28 +77,42 @@ from oracle.oci_recovery_mcp_server.models import (
     map_db_backup_config,
     map_db_system,
     map_db_system_summary,
-    map_work_request,
     map_protected_database,
     map_protected_database_summary,
     map_protection_policy,
     map_recovery_service_subnet,
     map_recovery_service_subnet_details,
+    map_work_request,
 )
 
 from . import __project__, __version__
+from .multitenant_auth import TENANT_CLAIM, MultiTenantOCIAuth, _domain_to_url
+from .tenancy_registry import (
+    RegistryError,
+    TenancyEntry,
+    TenancyRegistry,
+    load_registry,
+)
+
+# Load configuration from a .env file (if present) so all settings can live in one
+# config file instead of being exported as environment variables. This runs before
+# any module-level env reads below. Precedence: real environment variables win over
+# the file (override=False). Point ORACLE_MCP_ENV_FILE at a specific file to override
+# the default ".env" discovery (which walks up from the current working directory).
+_ENV_FILE = os.getenv("ORACLE_MCP_ENV_FILE") or find_dotenv(usecwd=True)
+if _ENV_FILE:
+    load_dotenv(_ENV_FILE, override=False)
 
 """MCP tools available in this server:
+- list_subscribed_regions
 - list_protected_databases
 - get_protected_database
 - summarize_protected_database_health
 - summarize_protected_database_redo_status
 - summarize_backup_space_used
 - check_recovery_service_limits
-- list_subscribed_regions
 - list_protection_policies
 - get_protection_policy
-- list_recovery_service_subnets
-- get_recovery_service_subnet
 - get_recovery_service_metrics
 - list_databases
 - get_database
@@ -106,7 +120,6 @@ from . import __project__, __version__
 - get_backup
 - list_restore
 - summarize_protected_database_backup_destination
-- list_db_homes
 - get_db_home
 - list_db_systems
 - get_db_system
@@ -118,6 +131,7 @@ You very well know how to generate a presentable charts for the executives.
 Make sure the chart is loadable and there are no errors while loading chart.
 
 Visualise OCI Recovery - Dashboard charts in one html document with below metrics in the given compartment.
+Include both OCI Database Service resources and all cloud-protected databases returned by the Recovery Service tools.
 Display the Title - OCI Recovery - Dashboard
 Under the Title, mention the compartment name.
 Under this compartment name add a note: Generated using Recovery Service MCP Server
@@ -146,6 +160,7 @@ Title - ACTIVE protected databases by real time redo.
 In the Fourth row, report the protected databases with OCID, database db unique name, health status,
 lifecycle state,
 redo status, backup space used in tabular format.
+Include every cloud-protected database returned by list_protected_databases in this table.
 Filterable columns - Health status, Redo status, life cycle state.
 This data is very important.
 Extract details carefully from list protecetd datbase output and map the columns to the OCIDs.
@@ -283,6 +298,875 @@ Use soft colors in the chart - executive appealing colors.
 Demarcate between the rows.
 Since this is a dashboard make sure user gets the visibility of most charts without scrolling.
 Create a responsive layout minimizing scrolling.
+"""
+
+
+CLOUD_PROTECT_ONBOARDING_PROMPT = """
+You are an Oracle Database Cloud Protect onboarding assistant.
+
+Your task is to assess readiness and guide the onboarding of an on-premises Oracle Database to OCI Zero Data Loss Autonomous Recovery Service using Cloud Protect.
+
+AUTHORITATIVE GUIDANCE
+
+Before making recommendations or generating commands, retrieve and use the latest applicable Oracle documentation, including:
+
+* Mandatory Requirements Checklist for Recovery Service
+* Cloud Protect prerequisites
+* Protecting on-premises databases using Cloud Protect
+* Adding an on-premises database to Recovery Service
+* Relevant networking, IAM, authentication, protection policy, and service-limit documentation
+
+The documentation may change. Treat the retrieved documentation as authoritative over remembered procedures, commands, requirements, or examples.
+
+Apply only requirements relevant to an on-premises Cloud Protect deployment. Do not apply OCI Database or multicloud-specific requirements unless they are explicitly relevant to the target environment.
+
+State which documentation was consulted and identify any required documentation that could not be retrieved.
+
+EXECUTION CONTEXT
+
+This prompt does not itself inspect, modify, or onboard the target environment.
+
+The MCP server provides this prompt as guidance only. Any discovery, validation, or onboarding operation must be performed by the model through authorized capabilities made available by the invoking client.
+
+Before performing prerequisite validation or onboarding:
+
+* inspect the capabilities exposed by the invoking client;
+* identify which capabilities are authorized and appropriate for the target environment;
+* determine whether those capabilities provide sufficient access to verify the applicable prerequisites;
+* use only authorized capabilities suitable for the requested operation;
+* do not assume that a particular remote shell, database connection, OCI tool, or execution mechanism is available.
+
+If the available capabilities and their authorization scope cannot be determined automatically, ask the operator which authorized capabilities are available for prerequisite verification.
+
+The question should be concise and may ask whether the model is authorized to use capabilities such as:
+
+* remote inspection of the target database host;
+* read-only access to the target database;
+* OCI and Recovery Service resource inspection;
+* DNS and network testing from the target environment;
+* SQLcl and Cloud Protect operations on the target database host;
+* access to all relevant nodes and instances in a RAC or clustered deployment.
+* Oracle software owner is a member of the OSBACKUPDBA group (typically backupdba)
+
+Ask only about capabilities that are necessary for the applicable prerequisites and are not already exposed or described. Do not ask the operator for passwords, private keys, wallet contents, tokens, or other secret values.
+
+Appropriate capabilities may include:
+
+* remote target-host inspection;
+* database access on or to the target host;
+* OCI and Recovery Service inspection;
+* DNS and network validation from the target environment;
+* SQLcl and Cloud Protect operations on the target database host.
+
+When such capabilities are available, use them to inspect the actual target host, database, and OCI environment.
+
+If required capabilities are unavailable, unauthorized, or provide insufficient access:
+
+* do not claim that the associated requirement has been verified;
+* classify it as not verified;
+* explain what capability or authorization is missing;
+* provide concise instructions that an authorized operator can use to complete the verification.
+
+For RAC or clustered deployments, consider all relevant nodes and instances where the current Oracle documentation requires node-specific or instance-specific validation or execution.
+
+ONBOARDING OBJECTIVE
+
+Determine whether the target database satisfies the current mandatory requirements for onboarding to Recovery Service using Cloud Protect.
+
+Use your judgment to identify and perform the checks necessary to evaluate:
+
+* database and platform support;
+* Cloud Protect and SQLcl readiness;
+* Recovery Service connectivity;
+* OCI resources, limits, IAM, and policies;
+* encryption and wallet readiness;
+* required Oracle libraries and configuration;
+* DNS and network readiness;
+* Oracle software owner is a member of the OSBACKUPDBA group (typically backupdba)
+* conflicts with existing backup arrangements;
+* any additional mandatory requirement stated in the current documentation.
+
+The listed areas are guidance, not an exhaustive checklist. Adapt the assessment to the current documentation, target architecture, database release, deployment topology, and authorized capabilities available.
+
+Do not rely solely on user-provided values when they can be safely and independently verified through authorized capabilities.
+
+SQLCL AND CLOUD PROTECT VALIDATION
+
+Before confirming that SQLcl is available and suitable for Cloud Protect onboarding, verify more than the presence of the SQLcl executable.
+
+Confirm that the installed SQLcl and its Cloud Protect functionality can recognize, validate, or otherwise operate with the given Recovery Service subnet OCID
+
+
+Use a read-only or non-destructive capability check where possible.
+
+Do not mark SQLcl readiness as satisfied solely because:
+
+* the `sql` executable exists;
+* SQLcl returns a version;
+* the `rcv` command is present;
+* a database connection can be established.
+
+Treat SQLcl readiness as satisfied only when the installed SQLcl and Cloud Protect command set support the required onboarding syntax and can accept or validate the applicable subnet resource identifier.
+
+If the capability cannot be safely tested, classify it as not verified and explain what operator validation is required.
+
+SUBNET INPUT GUIDANCE
+
+When preparing the `rcv add database` operation, account for the fact that the command may accept a subnet as well as a Recovery Service subnet.
+
+Do not assume that the input must always be a Recovery Service subnet OCID.
+
+Determine from the latest documentation, command help, and available environment context which subnet resource type is valid and appropriate for the target onboarding operation.
+
+Before generating the command:
+
+* identify whether the supplied identifier refers to a subnet or a Recovery Service subnet;
+* validate that the resource exists and belongs to the intended region, compartment, and network context;
+* use the correct argument and syntax supported by the installed SQLcl and current Cloud Protect command;
+* do not silently convert, substitute, or invent a subnet identifier;
+* explain which subnet resource type is being used and why.
+
+OPERATING PRINCIPLES
+
+* Begin with discovery and read-only validation.
+* Use the least-privileged available mechanism.
+* Prefer structured, purpose-specific capabilities over arbitrary shell execution.
+* Perform host-dependent checks from the target host or an equivalent target-context capability.
+* Verify that a capability is authorized for the target and intended operation before using it.
+* Do not attempt to bypass unavailable capabilities or insufficient authorization.
+* Do not invent commands, parameters, OCIDs, paths, endpoints, or configuration values.
+* Do not expose passwords, wallet contents, private keys, tokens, or other secrets.
+* Distinguish confirmed facts from assumptions, inferences, and recommendations.
+* Treat inaccessible or unverifiable requirements as not verified rather than satisfied.
+* Stop and explain when the documentation, requested configuration, and observed environment conflict.
+* Ask only for information or authorization details that cannot be safely discovered.
+* Require explicit approval before making changes to the database, database host, OCI resources, network, wallets, backup configuration, or protection settings.
+* Limit an approval to the clearly described next phase unless the user explicitly authorizes a broader scope.
+
+READINESS DECISION
+
+For each applicable mandatory requirement, determine whether it is:
+
+* satisfied;
+* not satisfied;
+* not verified;
+* not applicable.
+
+Use evidence from the target database host, database, OCI, and Recovery Service as appropriate.
+
+The database is ready for onboarding only when all applicable mandatory requirements have been verified as satisfied.
+
+If the database is not ready:
+
+* identify the requirements that are blocking readiness;
+* distinguish failed requirements from requirements that could not be verified;
+* identify any missing capability or authorization responsible for an unverified result;
+* recommend the minimum set of actions needed to make the environment ready.
+
+Do not produce an overly detailed checklist unless the operator requests one. Summarize the important findings and retain enough evidence to support each conclusion.
+
+ONBOARDING EXECUTION
+
+When all applicable mandatory requirements are satisfied:
+
+1. Present a concise onboarding plan based on the current documentation.
+2. Explain the intended changes, affected resources, and expected outcome.
+3. Confirm that the required execution capabilities are available and authorized.
+4. Request approval before state-changing operations.
+5. Use authorized capabilities exposed by the invoking client to perform the approved onboarding operations.
+6. Execute the onboarding in logical, verifiable phases.
+7. Verify the outcome using evidence from both the target database environment and Recovery Service.
+
+If the available capabilities support assessment but not execution, provide the approved operations or commands for an authorized operator rather than claiming to have executed them.
+
+Do not claim success merely because a command or operation completed. Confirm, as applicable, that:
+
+* the protected database resource exists and is healthy;
+* database registration completed;
+* Cloud Protect configuration completed;
+* the intended protection policy is assigned;
+* the expected protection status is active.
+
+OUTPUT
+
+Return:
+
+1. Documentation consulted
+2. Target environment summary
+3. Available and authorized capabilities
+4. Missing capabilities or authorization
+5. Readiness assessment
+6. Blocking or unverified requirements
+7. Recommended actions
+8. Proposed onboarding plan
+9. Operations or commands for the next approved phase
+10. Final verification, when execution has occurred
+
+Keep the response concise, but include enough evidence for an operator to understand and trust each conclusion.
+
+Never state that the environment was inspected, a requirement was verified, onboarding was performed, or protection was enabled unless the available authorized capabilities or operator-provided evidence directly support that conclusion.
+"""
+
+
+OUT_OF_PLACE_RESTORE_OF_DATABASE_PROMPT = """
+Use RMAN and Recovery Service to restore and recover database <source database name>
+
+You are guiding a CDB out-of-place recovery to an alternate location using RMAN and Recovery Service
+Use this guidance only for recovery of an Oracle Multitenant CDB. The restored database retains the source DBID. Use only these resources:
+
+* Cloud Protect instructions: https://docs.oracle.com/en/cloud/paas/recovery-service/dbrsu/protecting-premises-databases-using-recovery-service.html
+* The OCI Recovery MCP server
+* The local CDB out-of-place disaster recovery runbook (annexed below)
+
+Gather the source database identity, DB_UNIQUE_NAME, DBID, Oracle and Grid release/patch levels, ASM/FRA layout, TDE keystore and password-file recovery locations, recovery objective, RCV metadata, and network/wallet material. Store the necessary files only in the approved working directory.
+
+If the user provides a source database host name or IP address, collect the required source database details directly from that host using approved access methods. Otherwise, ask the user to provide the source database address or supply the required details manually. Never invent missing source database information.
+
+TARGET ENVIRONMENT
+
+* Source database name: <source database name>
+* Target database address: <target database address>
+* Recovery Service protected database OCID of the source database: <ocid of recovery service protected databases>
+* Source database address(if provided): <source database address>
+* Approved connection details: <connection details>
+
+RECOVERY AUTHORIZATION AND SAFETY
+
+Ask approval from user to copy and stage sensitive restore material previously collected from source database to <target database address>. Existing databases on <target database address> can be destroyed.
+
+Before any destructive action, identify the exact target host, target database/Clusterware resources, and files that will be affected. Use the supplied connection details only. Do not invent connection details, database identifiers, paths, OCIDs, passwords, wallet contents, or recovery targets. Stop and request the missing information when it cannot be discovered through the supplied connections, approved working directory, OCI Recovery MCP server, or Cloud Protect instructions.
+
+Prerequisites on the Target Database Host
+1. Verify SQLcl installation and confirm that SQLcl is installed and that the installed version supports the required rcv commands.If SQLcl is not installed, download the latest SQLcl RPM and install it on <target database host> using:export RPM_SQLCL_INSTALL_AS_ORACLE=true rpm -Uvh <sqlcl-rpm-file>
+2. Verify OSBACKUPDBA group membership Confirm that the Oracle software owner is a member of the OSBACKUPDBA operating system group, typically named backupdba.If the Oracle software owner is not a member, add the user to the appropriate group.
+3. Verify OCI profile configuration Confirm that an OCI CLI profile is configured for the Oracle software owner. If no OCI profile is configured, ask the user to configure it before proceeding.
+
+
+REQUIRED RECOVERY FLOW
+
+Use the protected database OCID above to import or recover destination-local RCV metadata for the lost source protected database. Validate the RCV restore range and Recovery Service catalog identity from the destination before restoring. The catalog must resolve to the intended source database name and DBID.
+
+1. Confirm the recovery objective and source identity from the approved working directory, RCV metadata, and Recovery Service inventory.
+2. Validate destination Oracle/Grid compatibility, ASM/FRA capacity, DNS/network access to Recovery Service, OCI authentication, and availability of required TDE keystore and password-file material.
+3. If sqlcl doesnot support rcv commands then download the latest SQLcl. Install it on <target database address> with:
+
+   export RPM_SQLCL_INSTALL_AS_ORACLE=true
+   rpm -Uvh <sqlcl rpm>
+
+4. Use SQLcl only for Cloud Protect `rcv` commands and named RCV connections; use sqlplus for local OS-authenticated `/ as sysdba` checks.
+5. Configure or validate destination Cloud Protect authentication and Recovery Service subnet connectivity. Import the protected database by OCID when supported; otherwise restore the preserved RCV network and wallet metadata from the working directory with restrictive permissions.
+6. Run `rcv show restore_range` for the source DB_UNIQUE_NAME. Stop unless the selected timestamp, SCN, or restore point is within that range.
+7. Generate the destination RMAN environment with Cloud Protect, source it, and validate the Recovery Service catalog alias before continuing.
+8. Restore the TDE keystore and create or restore the password file on the target. Build a destination-safe PFILE using destination ASM/FRA paths; start the replacement instance in NOMOUNT with `cluster_database=FALSE`.
+9. Restore and mount the control file using the source DBID. Validate the mounted database name and DBID, then disable block change tracking.
+10. Preview the restore and determine all datafile, tempfile, and online redo relocation requirements before the full restore.
+11. Restore and recover the database using exactly 8 RMAN SBT channels. Use the validated recovery target and destination-specific RCV wallet/SBT-library settings. Do not open the database until recovery evidence shows no unresolved datafile recovery errors.
+12. Relocate source-only redo members as needed, open with RESETLOGS, open and save state for all PDBs, validate TDE wallet status, recreate missing tempfiles, and validate block-change tracking and corruption views.
+13. Convert the recovered instance back to RAC only after successful single-instance recovery. Register the recovered database with Cloud Protect and run the required initial level 0 backup.
+
+Use the local runbook for exact command syntax and destination-specific paths. Present the planned commands for review before each destructive phase, and report the evidence gathered after every phase. Never claim restore, recovery, RESETLOGS, Cloud Protect registration, or the level 0 backup succeeded unless the authorized connections or command results directly prove it.
+
+CDB out-of-place recovery runbook :
+
+Runbook:  CDB Out-of-Place Recovery to alternate location with RMAN and Recovery Service
+This cookbook describes how to recover an Oracle Multitenant CDB to a different on-premises cluster after the source cluster has been lost or deleted due to a disaster
+or when an alternate database needs to be created for testing, reporting or auditing purposes.
+* The source database was protected by Cloud Protect / OCI Recovery Cloud Service (RCV).
+* The restore is performed to a separate destination cluster.
+* The restored database keeps the source DBID.
+
+Required Inputs
+Capture the following information before starting. Appendix A provides additional detail and example commands for collecting these inputs.
+If its not available ask for the inputs from the user.
+Input Group	Required Values
+Recovery decision	Production disaster replacement or test/drill restore; target recovery time, SCN, restore point, or “latest available”; approved data-loss objective
+Source identity	DB_NAME, DB_UNIQUE_NAME, DBID, CDB/PDB names, database incarnation, platform, Oracle Database release, patch level, COMPATIBLE value
+Cloud Protect / RCV	Protected database OCID, RCV connection name, DBRS catalog alias, recovery service endpoint, compartment OCID, VCN/subnet OCIDs, protection policy, restore range, control file autobackup or backup piece handle, preserved RCV network/wallet archive for the protected source database
+Destination cluster	Hostnames, Oracle owner, Grid home, Oracle home, SQLcl path, ASM disk groups, FRA disk group and size, listener/SCAN details
+Restore file placement	Destination DB_UNIQUE_NAME, destination ORACLE_SID, db_create_file_dest, db_recovery_file_dest, control_files, online redo log placement, tempfile placement
+Security material	TDE keystore or wallet backup, wallet password if password-based, wallet_root, tde_configuration, password file backup or secured SYS / SYSBACKUP password source
+Source configuration backup	Saved pfile/spfile text, srvctl config database, service definitions, redo thread/log group layout, undo tablespaces, PDB open/save-state requirements
+Operational cutover	Application/service DNS targets, client connection strings, monitoring changes, Cloud Protect re-registration plan, post-recovery level 0 backup window
+Recovery Process Outline
+* Validate Cloud Protect restore range and Recovery Service catalog access from the destination cluster.
+* Import, recreate, or restore preserved destination-local RCV metadata for the lost source protected database.
+* Restore required TDE keystore material and create or restore the password file on the destination.
+* Restore or create an PFILE
+* Restore the control file
+* Restore and recover the database
+* Open database with RESETLOGS
+* Register the recovered database with Cloud Protect and run the initial level 0 backup
+
+
+Pre-requisites
+1. The latest version of SQLcl must be installed on the destination cluster. Check if sqlcl supports rcv commands.  Use SQLcl for Cloud Protect rcv commands and named RCV connections only. For local OS-authenticated database checks such as / as sysdba, use sqlplus.
+2. Oracle Grid Infrastructure and Oracle Database software must be installed on the destination cluster at a compatible release and patch level. Use the same database release and patch level as the source whenever possible. Confirm DB COMPATIBLE <= ASM COMPATIBLE.RDBMS.
+3. The destination cluster must have network connectivity to OCI Recovery Service through the appropriate recovery service subnet, DNS/hosts configuration, and OCI authentication method.
+4. The required TDE keystore material must be available outside the destroyed source cluster. If the source database used TDE and the keystore was lost with the source cluster, encrypted tablespaces cannot be recovered.
+5. The source database must have been backed up successfully through Cloud Protect / RCV, and the selected recovery point must be inside the validated restore range.
+6. The destination cluster must have enough ASM/FRA capacity for restored datafiles, archived redo required for recovery, online redo logs, tempfiles, control files, and post-RESETLOGS backup activity.
+
+
+
+GENERIC PLACEHOLDER CONVENTION
+Values in braces, for example {source_dbid}, must be supplied for the target environment before execution.
+Preserve the source DB_NAME from the backup/control file; use a distinct destination DB_UNIQUE_NAME for drills or coexistence scenarios.
+
+Use the original DB_UNIQUE_NAME only when this recovery is the production replacement and the old source database is permanently gone from Clusterware, Cloud Protect scheduling, monitoring, and operational DNS.
+
+
+Phase 1 - Validate Cloud Protect Backups and Destination RCV Connectivity
+Step 1 - Confirm recovery objective and source identity
+Record the recovery point and database identity before running restore commands.
+Recovery objective: latest available | timestamp | SCN | restore point
+Source DB_NAME: {source_db_name}
+Source DB_UNIQUE_NAME:{source_db_unique_name}
+Source DBID: {source_dbid}
+Destination DB name: {destination_db_name}
+Destination unique: {destination_db_unique_name}
+Destination SID: {destination_oracle_sid}
+The source DBID is required when restoring a server parameter file or control file from autobackup. Obtain it from pre-disaster runbooks, prior RMAN logs, Cloud Protect inventory, rcv show database, or any preserved control file autobackup naming information.
+Step 2 - Establish OCI connectivity to RCV from the destination host
+Run these commands on the destination host as oracle.
+export ORACLE_BASE
+export ORACLE_HOME
+export PATH=${SQLCL_HOME}/bin:${ORACLE_HOME}/bin:${PATH}
+
+If Cloud Protect has not already been setup, configure OCI authentication if this destination has not yet been configured for Cloud Protect:
+sql /nolog
+SQL> rcv configure authentication -method api_key -oci_config {path_to_oci_config}
+SQL> exit
+Configure or validate the recovery service subnet that allows this destination cluster to reach Recovery Service:
+sql /nolog
+SQL> rcv add recovery_service_subnet \
+ -vcn_id {vcn_ocid} \
+ -compartment_id {compartment_ocid} \
+ -subnet_id {subnet_ocid}
+SQL> exit
+Run the host configuration schedule as root to auto-manage DNS/host entries for the RCV catalog endpoints:
+${SQLCL_HOME}/bin/sql /nolog
+SQL> rcv add schedule -job_type CONFIGURE_HOST
+SQL> exit
+
+To recover Cloud Protect metadata for the lost protected database, import by protected database OCID:
+sql /nolog
+SQL> rcv import database -id {existing_protected_database_ocid}
+SQL> exit
+If rcv import database is not available, fails, or cannot be completed during the disaster window, restore the pre-collected RCV metadata archive for the protected source database. This archive must contain the network and wallet directories from {oracle_base}/rcv/dbs/{source_db_unique_name} and must have been saved outside the destroyed source cluster.
+# Run on the destination host as oracle.
+mkdir -p ${ORACLE_BASE}/rcv/dbs/{destination_db_unique_name_lower}
+
+tar xpf {secure_dr_root}/{source_db_unique_name}/rcv_network_wallet_{backup_date}.tar \
+ -C ${ORACLE_BASE}/rcv/dbs/{destination_db_unique_name_lower}
+
+chmod 755 ${ORACLE_BASE}/rcv/dbs/{destination_db_unique_name_lower}/network
+chmod 700 ${ORACLE_BASE}/rcv/dbs/{destination_db_unique_name_lower}/wallet
+chmod 600 ${ORACLE_BASE}/rcv/dbs/{destination_db_unique_name_lower}/wallet/*
+
+Step 3 - Validate restore range from Cloud Protect
+Use the destination host's Cloud Protect metadata and identify the protected source database explicitly.
+sql /nolog
+SQL> rcv show restore_range -db_unique_name {source_db_unique_name}
+
+DB Unique Name: {source_db_unique_name}
+Low Time High Time Restore Point Name
+-------- --------- ------------------
+{restore_range_low_time} {restore_range_high_time}
+SQL> exit
+RCV database import/configuration enables rcv show restore_range -db_unique_name {source_db_unique_name} to provide the available restore range. The restore range confirms the database is recoverable.
+If Cloud Protect cannot return the range because destination-local DBRS metadata or wallet authentication is broken, use RMAN catalog-only checks as the fallback. After repairing DBRS connectivity, the RMAN connection should be to the Recovery Service catalog, not to the lost source database:
+export TNS_ADMIN=${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/network
+
+rman catalog '/@{source_dbrs_catalog_alias}'
+
+SET DBID {source_dbid};
+LIST INCARNATION;
+LIST BACKUP SUMMARY;
+LIST BACKUP OF ARCHIVELOG ALL COMPLETED AFTER "SYSDATE-7";
+
+Step 4 - Generate destination-local RMAN / RCV environment files
+Generate rman_env.sh and rcv_restore_template.rman on the destination host so SBT library and wallet references match the destination Oracle home.
+sql /nolog
+SQL> rcv show restore_range -db_unique_name {source_db_unique_name}
+SQL> rcv configure rman_env \
+ -db_unique_name {source_db_unique_name} \
+ -oracle_sid {destination_oracle_sid}
+SQL> exit
+Expected output:
+Generated a template backup script
+${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/rman_env/rcv_restore_template.rman
+RMAN Env script ${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/rman_env/rman_env.sh
+Source the generated environment and validate the DBRS catalog alias:
+source ${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/rman_env/rman_env.sh
+
+rman catalog '/@{source_dbrs_catalog_alias}' <<'EOF'
+LIST INCARNATION;
+EXIT
+EOF
+The catalog output must refer to the source DB_NAME and expected DBID. Stop if the catalog alias points to a different database.
+
+
+Phase 2 - Prepare the Destination Replacement Instance
+Step 1 - Restore required security material
+Restore the TDE keystore from the pre-disaster secure copy.
+# Run on destination host as oracle
+mkdir -p {destination_wallet_root}/{source_db_unique_name_lower}/tde
+
+# Replace {secure_wallet_backup_dir} with the wallet backup location
+cp -p {secure_wallet_backup_dir}/tde/* {destination_wallet_root}/{source_db_unique_name_lower}/tde/
+
+chmod 700 {destination_wallet_root}/{source_db_unique_name_lower}
+chmod 700 {destination_wallet_root}/{source_db_unique_name_lower}/tde
+chmod 600 {destination_wallet_root}/{source_db_unique_name_lower}/tde/*
+Create an auto-login keystore:
+sqlplus / as sysdba
+ADMINISTER KEY MANAGEMENT CREATE AUTO_LOGIN KEYSTORE
+ FROM KEYSTORE '{destination_wallet_root}/{source_db_unique_name_lower}/tde/'
+ IDENTIFIED BY '{wallet_password}';
+EXIT;
+Step 2 - Create the password file
+Create password file using the secured SYS password source. Use the same SYS / SYSBACKUP credentials.
+orapwd file=${ORACLE_HOME}/dbs/orapw${ORACLE_SID} \
+ password='{SYS_password}' \
+ force=y \
+ format=12
+Step 3 - Create a destination-safe pfile
+Use a minimal pfile. Update clusterware settings, archive destinations, and/or filesystem references for your environment.
+cat > ${ORACLE_HOME}/dbs/init${ORACLE_SID}.ora << 'EOF'
+*.db_name='{source_db_name}'
+*.db_unique_name='{destination_db_unique_name}'
+
+# Restore to destination ASM diskgroups using Oracle Managed Files.
+*.db_create_file_dest='{destination_data_diskgroup}'
+*.db_recovery_file_dest='{destination_recovery_diskgroup}'
+*.db_recovery_file_dest_size={fra_size}
+*.control_files='{destination_data_diskgroup}'
+
+*.diagnostic_dest='{oracle_base}'
+*.enable_pluggable_database=TRUE
+
+# TDE. Use the source wallet root path only if that path exists on destination.
+*.wallet_root='{destination_wallet_root}/{source_db_unique_name_lower}'
+*.tde_configuration='KEYSTORE_CONFIGURATION=FILE'
+
+*.remote_login_passwordfile='EXCLUSIVE'
+*.db_files={db_files_limit}
+*.compatible='{database_compatible_version}'
+
+# Start as single instance for restore/recovery. Convert to RAC after recovery.
+*.cluster_database=FALSE
+EOF
+Parameter notes:
+* db_name must match the source database name stored in the backup and control file.
+* db_unique_name may match the source only for the production replacement. Use a distinct name for drills.
+* db_create_file_dest and db_recovery_file_dest must point to destination ASM diskgroups.
+* Keep cluster_database=FALSE during restore/recovery. Register and start RAC instances after recovery is complete.
+* wallet_root and tde_configuration must point to the restored destination keystore before media recovery reads encrypted tablespaces.
+Step 4 - Start the replacement instance in NOMOUNT
+sqlplus /nolog
+conn / as sysdba
+STARTUP NOMOUNT PFILE='{destination_oracle_home}/dbs/init{destination_oracle_sid}.ora';
+EXIT;
+Validate the instance state:
+sqlplus / as sysdba
+SELECT instance_name, status FROM v$instance;
+SHOW PARAMETER db_name;
+SHOW PARAMETER db_unique_name;
+SHOW PARAMETER wallet_root;
+EXIT;
+
+
+Phase 3 - Restore the Control File, Database, and Recover
+Step 1 - Restore the control file from Cloud Protect / RCV
+Connect to the destination instance as the RMAN target and to the DBRS recovery catalog. Use the source DBID only for the control file restore while the target is in NOMOUNT.
+rman target / catalog '/@{source_dbrs_catalog_alias}'
+SET DBID {source_dbid};
+
+RUN {
+ ALLOCATE CHANNEL ch01 DEVICE TYPE SBT_TAPE
+ PARMS "SBT_LIBRARY={destination_oracle_home}/lib/libra.so,
+ ENV=(RA_WALLET='location=file:${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/wallet credential_alias={source_dbrs_catalog_alias}',
+ RA_FORMAT=TRUE)";
+
+ RESTORE CONTROLFILE FROM AUTOBACKUP;
+ ALTER DATABASE MOUNT;
+
+ RELEASE CHANNEL ch01;
+}
+If RESTORE CONTROLFILE FROM AUTOBACKUP cannot locate the needed backup, list the cataloged control file backups and restore the selected handle explicitly. Example of using explicit handle {controlfile_autobackup_handle_example} to restore successfully.
+SET DBID {source_dbid};
+LIST BACKUP OF CONTROLFILE;
+
+RUN {
+ ALLOCATE CHANNEL ch01 DEVICE TYPE SBT_TAPE
+ PARMS "SBT_LIBRARY={destination_oracle_home}/lib/libra.so,
+ ENV=(RA_WALLET='location=file:${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/wallet credential_alias={source_dbrs_catalog_alias}',
+ RA_FORMAT=TRUE)";
+
+ RESTORE CONTROLFILE FROM '{controlfile_backup_piece_or_handle}';
+ ALTER DATABASE MOUNT;
+
+ RELEASE CHANNEL ch01;
+}
+Validate the mounted control file identity:
+sqlplus / as sysdba
+SELECT name, dbid, db_unique_name, open_mode, database_role FROM v$database;
+SELECT resetlogs_change#, resetlogs_time, status FROM v$database_incarnation ORDER BY resetlogs_time;
+EXIT;
+Stop if the dbid or db name does not match the intended source database.
+BCT should be disabled following controlfile restore to prevent warnings and potential failure of the subsequent restore. To disable:
+sqlplus /nolog
+sql> conn / as sysdba
+alter database disable block change tracking;
+exit;
+Step 2 - Inspect original file names and determine relocation needs
+The restored control file records the original source file names. Query them before restore.
+sqlplus / as sysdba
+SET LINES 220
+COLUMN name FORMAT a120
+
+SELECT file#, name FROM v$datafile ORDER BY file#;
+SELECT group#, member FROM v$logfile ORDER BY group#, member;
+SELECT file#, name FROM v$tempfile ORDER BY file#;
+EXIT;
+If the destination has the same ASM diskgroup names and no storage overlap with the old source cluster, restoring to original ASM-style names may be acceptable. If destination diskgroup names differ, use SET NEWNAME commands for affected datafiles.
+Keep online redo log relocation separate with ALTER DATABASE RENAME FILE when the restored control file points to source-only redo locations.
+Step 3 - Preview and validate restore metadata
+Preview restore requirements before running the full restore. Include the selected recovery target, and include the same SET NEWNAME pattern planned for the actual restore.
+rman target / catalog '/@{source_dbrs_catalog_alias}'
+
+RUN {
+ SET UNTIL TIME "TO_DATE('{recovery_timestamp}','YYYY-MM-DD HH24:MI:SS')";
+ SET NEWNAME FOR DATABASE TO '{destination_data_diskgroup}';
+
+ ALLOCATE CHANNEL ch01 DEVICE TYPE SBT_TAPE
+ PARMS "SBT_LIBRARY={destination_oracle_home}/lib/libra.so,
+ ENV=(RA_WALLET='location=file:${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/wallet credential_alias={source_dbrs_catalog_alias}',
+ RA_FORMAT=TRUE)";
+
+ RESTORE DATABASE PREVIEW SUMMARY;
+ -- Optional when time allows:
+ -- RESTORE DATABASE VALIDATE;
+
+ RELEASE CHANNEL ch01;
+}
+For very large databases, run RESTORE DATABASE PREVIEW SUMMARY first and decide whether a full RESTORE DATABASE VALIDATE is practical during the disaster window.
+Step 4 - Build the restore and recovery script
+Create {restore_script_path} from the destination-generated RCV template and edit it for disaster restore.
+Use a timestamp, SCN, or restore point inside the restore range validated in Phase 1.
+# {restore_script_path}
+# Run from destination host as oracle:
+# rman target / catalog '/@{source_dbrs_catalog_alias}' \
+# cmdfile={restore_script_path} \
+# log={restore_log_path}
+
+# SET DBID is intentionally omitted after the restored controlfile is mounted.
+
+# Required only when using a password-based software keystore.
+# SET DECRYPTION WALLET OPEN IDENTIFIED BY '{wallet_password}';
+
+RUN {
+ # Choose one recovery target and keep it inside the validated restore range.
+ SET UNTIL TIME "TO_DATE('{recovery_timestamp}','YYYY-MM-DD HH24:MI:SS')";
+ # SET UNTIL SCN {recovery_scn};
+ # SET UNTIL RESTORE POINT {restore_point_name};
+
+ ALLOCATE CHANNEL ch01 DEVICE TYPE SBT_TAPE
+ PARMS "SBT_LIBRARY={destination_oracle_home}/lib/libra.so,
+ ENV=(RA_WALLET='location=file:${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/wallet credential_alias={source_dbrs_catalog_alias}',
+ RA_FORMAT=TRUE)";
+
+ ALLOCATE CHANNEL ch02 DEVICE TYPE SBT_TAPE
+ PARMS "SBT_LIBRARY={destination_oracle_home}/lib/libra.so,
+ ENV=(RA_WALLET='location=file:${ORACLE_BASE}/rcv/dbs/{source_db_unique_name_lower}/wallet credential_alias={source_dbrs_catalog_alias}',
+ RA_FORMAT=TRUE)";
+
+ SET NEWNAME FOR DATABASE TO '{destination_data_diskgroup}';
+
+ RESTORE DATABASE;
+ SWITCH DATAFILE ALL;
+ RECOVER DATABASE;
+
+}
+If online redo log member names in the restored control file point to source-only locations, rename them before opening:
+sqlplus / as sysdba
+
+ALTER DATABASE RENAME FILE '{source_data_diskgroup}/{source_db_unique_name}/ONLINELOG/{source_redo_member_1}'
+ TO '{destination_data_diskgroup}';
+
+ALTER DATABASE RENAME FILE '{source_recovery_diskgroup}/{source_db_unique_name}/ONLINELOG/{source_redo_member_2}'
+ TO '{destination_recovery_diskgroup}';
+
+EXIT;
+For ASM/OMF redo logs, changing only diskgroup names with destination DB_CREATE_FILE_DEST and DB_RECOVERY_FILE_DEST is usually preferred over hard-coding full OMF names.
+
+Step 5 - Execute restore and recovery
+rman target / catalog '/@{source_dbrs_catalog_alias}' \
+ cmdfile={restore_script_path} \
+ log={restore_log_path}
+Review the RMAN log before proceeding:
+grep -E "RMAN-|ORA-" {restore_log_path}
+Some RMAN-06054 / missing archived log messages may be expected at the end of incomplete recovery when RMAN reaches the selected recovery boundary.
+
+Step 6 - Validate recovery before opening RESETLOGS
+sqlplus / as sysdba
+
+SELECT name, dbid, open_mode, database_role, log_mode FROM v$database;
+SELECT instance_name, status FROM v$instance;
+
+SELECT file#, error, online_status, change#, time FROM v$recover_file;
+
+SELECT file#, name, error, recover
+FROM v$datafile_header
+WHERE recover = 'YES'
+OR error IS NOT NULL;
+
+SELECT name, open_mode, recovery_status FROM v$pdbs ORDER BY name;
+
+EXIT;
+Proceed only when the database is mounted, recovery reached the approved stopping point, and no datafiles show unresolved recovery errors in v$datafile_header. Treat v$recover_file rows with no error text as secondary information that should be reviewed by DBA, the results of v$datafile_header are more conclusive.
+
+Step 7 - Open the recovered database with RESETLOGS
+Opening with RESETLOGS is required after incomplete recovery and after recovery using a backup control file. This creates the new incarnation of the database.
+sqlplus / as sysdba
+
+ALTER DATABASE OPEN RESETLOGS;
+ALTER PLUGGABLE DATABASE ALL OPEN;
+EXIT;
+Step 8 - Validate CDB, PDBs, TDE wallet, and tempfiles
+sqlplus / as sysdba
+
+SELECT db_unique_name, name, dbid, open_mode, database_role, log_mode
+FROM v$database;
+
+SELECT name, open_mode, restricted, recovery_status
+FROM v$pdbs
+ORDER BY name;
+
+ALTER PLUGGABLE DATABASE ALL OPEN;
+ALTER PLUGGABLE DATABASE ALL SAVE STATE;
+
+SELECT con_id,
+ (SELECT name FROM v$containers c WHERE c.con_id = w.con_id) AS container_name,
+ status,
+ wallet_type,
+ keystore_mode
+FROM v$encryption_wallet w
+ORDER BY con_id;
+
+SELECT tablespace_name, file_name FROM dba_temp_files ORDER BY tablespace_name, file_name;
+
+EXIT;
+Recreate missing tempfiles as needed:
+sqlplus / as sysdba
+ALTER TABLESPACE TEMP ADD TEMPFILE '{destination_data_diskgroup}' SIZE {tempfile_initial_size} AUTOEXTEND ON NEXT {tempfile_autoextend_next} MAXSIZE {tempfile_max_size};
+EXIT;
+Step 9 - Validate block change tracking and post-recovery health
+sqlplus / as sysdba
+
+SELECT status, filename FROM v$block_change_tracking;
+
+-- Enable BCT.
+ALTER DATABASE ENABLE BLOCK CHANGE TRACKING USING FILE '{destination_data_diskgroup}';
+
+SELECT * FROM v$backup_corruption;
+SELECT * FROM v$copy_corruption;
+SELECT * FROM v$database_block_corruption;
+
+EXIT;
+
+
+Phase 4 - Post-restore clusterware options
+Apply this phase only if its RAC system. Skip this phase for Single instance database.
+
+Step 1 - Create a RAC-ready pfile/spfile
+Shut down the single-instance restored database:
+sqlplus / as sysdba
+SHUTDOWN IMMEDIATE;
+EXIT;
+Create {rac_pfile_path} with destination RAC settings:
+*.db_name='{source_db_name}'
+*.db_unique_name='{destination_db_unique_name}'
+*.control_files='{destination_data_diskgroup}/{destination_db_unique_name}/CONTROLFILE/{current_controlfile_name}'
+*.db_create_file_dest='{destination_data_diskgroup}'
+*.db_recovery_file_dest='{destination_recovery_diskgroup}'
+*.db_recovery_file_dest_size={fra_size}
+*.wallet_root='{destination_wallet_root}/{source_db_unique_name_lower}'
+*.tde_configuration='KEYSTORE_CONFIGURATION=FILE'
+*.compatible='{database_compatible_version}'
+*.cluster_database=TRUE
+*.remote_login_passwordfile='EXCLUSIVE'
+
+{destination_instance_1}.instance_number={instance_number_1}
+{destination_instance_1}.thread={redo_thread_1}
+{destination_instance_1}.undo_tablespace='{undo_tablespace_1}'
+
+{destination_instance_2}.instance_number={instance_number_2}
+{destination_instance_2}.thread={additional_redo_thread_number}
+{destination_instance_2}.undo_tablespace='{undo_tablespace_2}'
+Identify the restored control file name in ASM:
+asmcmd ls {destination_data_diskgroup}/{destination_db_unique_name}/CONTROLFILE
+Create the spfile in ASM:
+sqlplus / as sysdba
+STARTUP NOMOUNT PFILE='{rac_pfile_path}';
+CREATE SPFILE='{destination_data_diskgroup}/{destination_db_unique_name}/PARAMETERFILE/spfile{source_db_unique_name_lower}.ora'
+FROM PFILE='{rac_pfile_path}';
+SHUTDOWN IMMEDIATE;
+EXIT;
+Step 2 - Add redo threads for additional RAC instances
+Start one instance in mount/open mode with the RAC-ready spfile, then add redo for additional threads when needed.
+sqlplus / as sysdba
+STARTUP MOUNT;
+
+SELECT thread#, status, enabled FROM v$thread ORDER BY thread#;
+SELECT group#, thread#, bytes/1024/1024 AS mb, status FROM v$log ORDER BY thread#, group#;
+
+ALTER DATABASE ADD LOGFILE THREAD {additional_redo_thread_number}
+ GROUP {redo_group_1} ('{destination_data_diskgroup}', '{destination_recovery_diskgroup}') SIZE {redo_log_size} REUSE;
+
+ALTER DATABASE ADD LOGFILE THREAD {additional_redo_thread_number}
+ GROUP {redo_group_2} ('{destination_data_diskgroup}', '{destination_recovery_diskgroup}') SIZE {redo_log_size} REUSE;
+
+ALTER DATABASE ENABLE PUBLIC THREAD {additional_redo_thread_number};
+
+ALTER DATABASE OPEN;
+ALTER PLUGGABLE DATABASE ALL OPEN;
+ALTER PLUGGABLE DATABASE ALL SAVE STATE;
+SHUTDOWN IMMEDIATE;
+EXIT;
+Skip the add-logfile commands for any thread that already exists with adequate redo log groups and sizes.
+Step 3 - Register the recovered database with Oracle Clusterware
+Use the database-home srvctl for the database resource version.
+
+command -v asmcmd || {
+ export GRID_HOME={destination_grid_home}
+ export PATH=${GRID_HOME}/bin:${PATH}
+ command -v asmcmd
+}
+
+asmcmd mkdir {destination_data_diskgroup}/{destination_db_unique_name}/PASSWORD
+asmcmd cp ${ORACLE_HOME}/dbs/orapw{source_db_unique_name_lower} {destination_data_diskgroup}/{destination_db_unique_name}/PASSWORD/orapw{source_db_unique_name_lower}
+
+srvctl add database \
+ -db {destination_db_unique_name} \
+ -dbname {source_db_name} \
+ -oraclehome {destination_oracle_home} \
+ -spfile {destination_data_diskgroup}/{destination_db_unique_name}/PARAMETERFILE/spfile{source_db_unique_name_lower}.ora \
+ -pwfile {destination_data_diskgroup}/{destination_db_unique_name}/PASSWORD/orapw{source_db_unique_name_lower} \
+ -role PRIMARY \
+ -startoption open \
+ -stopoption immediate \
+ -diskgroup {destination_data_diskgroup_name},{destination_recovery_diskgroup_name}
+
+srvctl add instance -db {destination_db_unique_name} -instance {destination_instance_1} -node {destination_node_1}
+srvctl add instance -db {destination_db_unique_name} -instance {destination_instance_2} -node {destination_node_2}
+
+srvctl config database -db {destination_db_unique_name}
+srvctl start database -db {destination_db_unique_name}
+srvctl status database -db {destination_db_unique_name}
+Open and save PDB state across RAC instances:
+sqlplus / as sysdba
+ALTER PLUGGABLE DATABASE ALL OPEN INSTANCES=ALL;
+ALTER PLUGGABLE DATABASE ALL SAVE STATE INSTANCES=ALL;
+EXIT;
+Step 4 - Recreate services and complete client cutover
+Recreate application services from the pre-disaster srvctl config service output.
+srvctl add service \
+ -db {destination_db_unique_name} \
+ -service {service_name} \
+ -preferred {destination_instance_1},{destination_instance_2} \
+ -pdb {pdb_name}
+
+srvctl start service -db {destination_db_unique_name} -service {service_name}
+srvctl status service -db {destination_db_unique_name}
+
+Phase 5 - Register with Cloud Protect and Complete level 0 backup
+
+Step 1 - Register it with Cloud Protect as a Protected Database
+sql /nolog
+SQL> rcv add sysbackup_user -db_unique_name {destination_db_unique_name_lower}
+SQL> exit
+
+Verify the above step completed successfully before proceeding.
+
+Before any Cloud Protect onboarding operation, verify that the Oracle software owner is a member of the OSBACKUPDBA group (typically backupdba) and can successfully make a local OS-authenticated connection to the target database as SYSBACKUP.
+
+${SQLCL_HOME}/bin/sql -name {destination_rcv_connection_name}
+SQL> rcv add database -endpoint {recovery_service_endpoint} -compartment_id {compartment_ocid} -recovery_service_subnets {recovery_service_subnet_ocid} -protection_policy_name {protection_policy_name}
+SQL> exit
+
+Verify the above step completed successfully before proceeding.
+
+Step 2 - Enable Real Time Redo
+Validate RTR is enabled (if previously was enabled)
+${SQLCL_HOME}/bin/sql -name {destination_rcv_connection_name}
+SQL> rcv show database
+SQL> rcv add realtime_redo
+SQL> exit
+
+Verify the above step completed successfully before proceeding.
+
+Step 3 - Complete full backup
+${SQLCL_HOME}/bin/sql -name {destination_rcv_connection_name}
+SQL> rcv show database
+SQL> rcv add schedule -interval {backup_schedule_interval_minutes}
+SQL> rcv backup database -level 0
+SQL> rcv show restore_range -db_unique_name {destination_db_unique_name_lower}
+SQL> exit
+
+Verify the above step completed successfully before proceeding.
+
+Step 4 - Complete Healthchecks
+Validate Fleet agent scheduler is accurately processing backups.
+Health checks for the scheduler process:
+${SQLCL_HOME}/bin/sql -name {destination_rcv_connection_name}
+SQL> rcv run checks -name SCHEDULER_STATUS
+SQL> rcv run checks -group health
+SQL> exit
+
+
+Appendix A - Required Input Detail
+
+Input	Example / Observed Value	Collection / Why It Is Required
+Recovery mode	Production disaster replacement or test/drill restore	Determines whether the recovered database can reuse the original DB_UNIQUE_NAME or must use a distinct value.
+Recovery target	<timestamp> SCN, restore point, or latest available	Must be inside the restore range returned by Cloud Protect. Use rcv show restore_range -db_unique_name c1db1.
+Source DB name		Required because the restored control file and RMAN catalog identify the database by DB_NAME and DBID.
+Source DB unique name		Used to identify the protected source database in Cloud Protect, RCV metadata, wallet paths, and restore-range checks.
+Source DBID		Required for control file restore from autobackup and for verifying the RMAN catalog identity. Collect from runbooks, prior RMAN logs, LIST INCARNATION, or preserved control file autobackup information.
+Source protected database OCID		Required when importing or validating the lost source protected database metadata on the destination host.
+Recovery Service endpoint		Required for rcv import database and rcv add database when the endpoint is not inferred.
+Compartment OCID	{compartment_ocid}	Required for Cloud Protect registration and recovery service subnet association.
+Recovery service subnet OCID	{recovery_service_subnet_ocid}	Required so the recovered database can reach OCI Recovery Service through the correct networking path.
+Protection policy		Required when registering the recovered database as a protected database. Confirm retention and RPO expectations before use.
+Source RCV connection		Used before disaster, or from restored metadata, to run source-oriented Cloud Protect checks when the source database identity is being referenced.
+Replacement RCV connection		Used after recovery registration to run rcv show database, real-time redo configuration, backup, schedule, and health-check commands against the recovered database.
+Source DBRS catalog alias		Used by RMAN during restore and recovery to connect to the Recovery Service catalog for the lost source protected database.
+Replacement DBRS catalog alias		Used after Cloud Protect re-registration and post-recovery backup of the replacement database.
+Control file backup handle		Required if RESTORE CONTROLFILE FROM AUTOBACKUP cannot locate the desired control file automatically.
+Destination cluster hosts		Required for restore execution, Clusterware registration, RAC instance placement, and service configuration.
+Destination Oracle owner		Required for running SQLcl, RMAN, sqlplus, and database-home srvctl commands.
+Destination Grid home	{destination_grid_home}	Required when asmcmd or Grid-home utilities are not already in PATH.
+Destination Oracle home		Required for destination sqlplus, RMAN, SBT library, password file placement, and database-home srvctl.
+SQLcl path		Required for Cloud Protect rcv commands and named RCV connections.
+Destination DB name		Must match the source DB_NAME for RMAN restore from the source backup and restored control file.
+Destination DB unique name		Use a distinct value for drills. Use the original value only for the final production replacement after the old source identity is gone.
+Destination Oracle SID		Used to start the single-instance replacement database for restore and recovery.
+Destination RAC instances		Required when converting the restored single-instance database back to RAC and registering instances with Clusterware.
+Destination data diskgroup		Used for OMF datafiles, control files, password file, SPFILE, BCT, and redo placement as configured.
+Destination recovery diskgroup		Used for FRA, archived redo, recovery files, and optional multiplexed online redo placement.
+FRA size		Must be large enough for restored archived redo, recovery operations, and post-RESETLOGS activity.
+TDE wallet root		Required before media recovery reads encrypted tablespaces.
+TDE keystore backup		Required because the source cluster is unavailable. If lost, encrypted tablespaces cannot be recovered.
+Wallet password		Required when the keystore is password-based or when creating an auto-login keystore from a password-based keystore.
+Password file source		Required to create the destination password file and support RMAN/Clusterware authentication.
+Destination password file		Required for the single-instance restore and later RAC Clusterware registration.
+Source configuration backup		Required to recreate initialization parameters, RAC instance/thread layout, services, and client cutover configuration.
+Redo thread and undo layout		Required to validate or recreate RAC redo threads and per-instance undo settings.
+PDB state requirements		Required to validate recovered PDBs and preserve expected open state after RAC startup.
+Application service definitions		Required to recreate services and complete client cutover.
+Cutover data	DNS targets, client connect strings, monitoring changes	Required to route applications and operations to the recovered database.
+Real-time redo requirement	Match source setting when previously enabled	Required to decide whether to run rcv add realtime_redo after Cloud Protect re-registration.
+Post-recovery level 0 window	Approved backup window after RESETLOGS	Required because a fresh full backup establishes the recovered database's new protection baseline.
 """
 
 
@@ -584,19 +1468,28 @@ def _tool_logger(tool_name: str):
 # Auth/Config
 
 
-def _effective_auth_method() -> Literal["session", "apikey"]:
+def _effective_auth_method() -> Literal["session", "apikey", "oauth"]:
     """
     Auth selection is done strictly via environment variables (set by the MCP host).
 
     Required:
-      - ORACLE_MCP_AUTH_METHOD: "session" or "apikey"
+      - ORACLE_MCP_AUTH_METHOD: "session", "apikey", or "oauth"
 
     Optional:
       - ORACLE_MCP_AUTH_PROFILE: OCI config profile name (defaults to OCI_CONFIG_PROFILE/DEFAULT)
+
+    Modes:
+      - "session" / "apikey": local ~/.oci/config based auth. Works over stdio (default)
+        or the plain HTTP transport (ORACLE_MCP_HOST/ORACLE_MCP_PORT).
+      - "oauth": OCI IAM (IDCS) domain OAuth + UPST token exchange, served over the
+        streamable HTTP transport. No local OCI config file is needed; a per-request
+        UPST signer is built from the authenticated user's IAM domain access token.
     """
     m = (os.getenv("ORACLE_MCP_AUTH_METHOD") or "session").strip().lower()
     if m in ("apikey", "api_key", "api-key"):
         return "apikey"
+    if m in ("oauth", "token_exchange", "token-exchange", "upst"):
+        return "oauth"
     return "session"
 
 
@@ -607,45 +1500,27 @@ def _effective_profile_name() -> str:
     return os.getenv("OCI_CONFIG_PROFILE", oci.config.DEFAULT_PROFILE)
 
 
+def _first_env(*names: str, default: Optional[str] = None) -> Optional[str]:
+    """Return the first non-empty environment variable among names."""
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and v.strip() != "":
+            return v.strip()
+    return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _load_oci_config_for_server() -> dict:
     config = oci.config.from_file(profile_name=_effective_profile_name())
     user_agent_name = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
     config["additional_user_agent"] = f"{user_agent_name}/{__version__}"
     return config
-
-
-def _get_profile_value(key: str):
-    parser = configparser.ConfigParser()
-    parser.read(os.path.expanduser(os.getenv("OCI_CONFIG_FILE", oci.config.DEFAULT_LOCATION)))
-    profile = _effective_profile_name()
-    return (parser[profile].get(key) if profile in parser else None) or parser.defaults().get(key)
-
-
-def _get_http_config_and_signer(region: str | None = None):
-    if not (os.getenv("ORACLE_MCP_HOST") and os.getenv("ORACLE_MCP_PORT")):
-        return None, None
-    token = get_access_token()
-    if token is None:
-        raise RuntimeError("HTTP requests require an authenticated IDCS access token.")
-    domain = os.getenv("IDCS_DOMAIN")
-    client_id = os.getenv("IDCS_CLIENT_ID")
-    client_secret = os.getenv("IDCS_CLIENT_SECRET")
-    if not all((domain, client_id, client_secret)):
-        raise RuntimeError(
-            "HTTP requests require IDCS authentication. Set IDCS_DOMAIN, IDCS_CLIENT_ID, and IDCS_CLIENT_SECRET."
-        )
-    base_region = region or os.getenv("OCI_REGION")
-    if not base_region:
-        raise RuntimeError("HTTP requests require OCI_REGION.")
-    user_agent_name = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
-    config = {"region": base_region, "additional_user_agent": f"{user_agent_name}/{__version__}"}
-    return config, oci.auth.signers.TokenExchangeSigner(
-        token.token,
-        f"https://{domain}",
-        client_id,
-        client_secret,
-        region=config.get("region"),
-    )
 
 
 def _build_signer_for_session(config: dict):
@@ -656,143 +1531,386 @@ def _build_signer_for_session(config: dict):
     return oci.auth.signers.SecurityTokenSigner(token, private_key)
 
 
-def _get_oci_client_kwargs(signer=None):
-    kwargs = {
-        "circuit_breaker_strategy": oci.circuit_breaker.CircuitBreakerStrategy(
-            failure_threshold=int(os.getenv("OCI_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "10")),
-            recovery_timeout=int(os.getenv("OCI_CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "30")),
-        ),
-        "circuit_breaker_callback": lambda exc: logger.warning(
-            "Circuit breaker triggered: %s", exc
-        ),
+# ---------------- OAuth / token-exchange (single hosted, multi-tenancy) ----------------
+#
+# In "oauth" mode one process serves many tenancies behind a single MCP URL.
+# Per-tenancy IDCS domain + confidential OAuth app secrets live in a server-side
+# tenancy registry (ORACLE_MCP_TENANCY_REGISTRY). A user selects their tenancy
+# with the X-OCI-Tenancy header; FastMCP's per-tenancy OCIProvider (see
+# multitenant_auth) handles login. The header is enforced at verification (a token
+# is only accepted for the tenancy it names; a mismatch -> 401 -> re-auth), and the
+# verified token carries the tenant alias (oracle_mcp_tenant_alias claim), which is
+# AUTHORITATIVE for all tool routing.
+#
+# Each tool call exchanges the user's IAM domain JWT for an OCI UPST token using
+# TokenExchangeSigner (built from the resolved tenancy's IDCS domain + credentials).
+# The signer self-refreshes the UPST, so we cache it per (tenant alias, token jti).
+
+# Legacy single-tenant env vars: used to synthesize a one-entry registry when no
+# registry file is configured (backward compatibility / simple single-tenant hosting).
+_ENV_IDCS_DOMAIN = ("ORACLE_MCP_IDCS_DOMAIN", "IDCS_DOMAIN")
+_ENV_IDCS_CLIENT_ID = ("ORACLE_MCP_IDCS_CLIENT_ID", "IDCS_CLIENT_ID")
+_ENV_IDCS_CLIENT_SECRET = ("ORACLE_MCP_IDCS_CLIENT_SECRET", "IDCS_CLIENT_SECRET")
+
+_oauth_signer_cache: dict[str, Any] = {}
+_oauth_signer_lock = threading.Lock()
+_OAUTH_SIGNER_CACHE_MAX = int(os.getenv("ORACLE_MCP_OAUTH_SIGNER_CACHE_MAX", "256"))
+
+_registry_singleton: Optional[TenancyRegistry] = None
+_registry_lock = threading.Lock()
+
+
+def _legacy_single_tenant_registry() -> Optional[TenancyRegistry]:
+    """Build a one-entry registry from the legacy single-tenant env vars, if set."""
+    domain = _first_env(*_ENV_IDCS_DOMAIN)
+    client_id = _first_env(*_ENV_IDCS_CLIENT_ID)
+    client_secret = _first_env(*_ENV_IDCS_CLIENT_SECRET)
+    tenancy_id = _first_env("ORACLE_MCP_TENANCY_ID", "TENANCY_ID_OVERRIDE")
+    region = _first_env("ORACLE_MCP_REGION", "OCI_REGION")
+    if not (domain and client_id and client_secret and tenancy_id and region):
+        return None
+    alias = _first_env("ORACLE_MCP_TENANCY_ALIAS", default="default")
+    body: dict[str, Any] = {
+        "tenancy_id": tenancy_id,
+        "idcs_domain": domain,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "region": region,
     }
-    if signer is not None:
-        kwargs["signer"] = signer
-    return kwargs
+    signing_key = _first_env("ORACLE_MCP_JWT_SIGNING_KEY")
+    if signing_key:
+        body["jwt_signing_key"] = signing_key
+    return TenancyRegistry.from_mapping({alias: body})
 
 
-# Create the FastMCP app that exposes the functions decorated with @mcp.tool
-mcp = FastMCP(name=__project__)
+def _get_registry() -> TenancyRegistry:
+    """Load (and cache) the tenancy registry from file or legacy env vars."""
+    global _registry_singleton
+    if _registry_singleton is not None:
+        return _registry_singleton
+    with _registry_lock:
+        if _registry_singleton is None:
+            if (os.getenv("ORACLE_MCP_TENANCY_REGISTRY") or "").strip():
+                _registry_singleton = load_registry()
+            else:
+                reg = _legacy_single_tenant_registry()
+                if reg is None:
+                    raise RegistryError(
+                        "oauth mode requires either ORACLE_MCP_TENANCY_REGISTRY (a "
+                        "tenancies.toml file) or the legacy single-tenant env vars "
+                        "(ORACLE_MCP_IDCS_DOMAIN, ORACLE_MCP_IDCS_CLIENT_ID, "
+                        "ORACLE_MCP_IDCS_CLIENT_SECRET, ORACLE_MCP_TENANCY_ID, "
+                        "ORACLE_MCP_REGION)."
+                    )
+                _registry_singleton = reg
+    return _registry_singleton
+
+
+def _reset_registry_cache() -> None:
+    """Test hook: drop the cached registry so the next call re-reads the env."""
+    global _registry_singleton
+    with _registry_lock:
+        _registry_singleton = None
+
+
+def _current_tenancy() -> TenancyEntry:
+    """
+    Resolve the tenancy for the current request from the verified token's
+    `oracle_mcp_tenant_alias` claim, which is authoritative for all tool routing.
+
+    Header/token consistency is already enforced upstream: MultiTenantOCIAuth.verify_token
+    narrows verification to the X-OCI-Tenancy tenancy, so a token that doesn't match a
+    known header value is rejected with 401 (the client re-authenticates) before any tool
+    runs. The cross-check below is only a defensive backstop for the rare case where the
+    header could not be read during verification; it warns (aliases only) and trusts the
+    token.
+    """
+    from fastmcp.server.dependencies import get_access_token
+
+    alias = None
+    try:
+        access = get_access_token()
+        if access is not None:
+            alias = (access.claims or {}).get(TENANT_CLAIM)
+    except Exception:
+        alias = None
+
+    entry = _get_registry().lookup(alias) if alias else None
+    if entry is None:
+        raise ValueError(
+            "No authenticated tenancy on this request. The access token is missing the "
+            "tenant claim; reconnect with the X-OCI-Tenancy header set."
+        )
+
+    # Defensive backstop only (token remains authoritative).
+    try:
+        from fastmcp.server.dependencies import get_http_headers
+
+        hdr = (get_http_headers() or {}).get("x-oci-tenancy")
+    except Exception:
+        hdr = None
+    if hdr:
+        hdr_entry = _get_registry().lookup(hdr)
+        if hdr_entry is not None and hdr_entry.alias != entry.alias:
+            logger.warning(
+                "X-OCI-Tenancy header (alias=%s) conflicts with the authenticated "
+                "tenancy (alias=%s); using the token's tenancy.",
+                hdr_entry.alias,
+                entry.alias,
+            )
+    return entry
+
+
+def _build_token_exchange_signer(entry: TenancyEntry):
+    """
+    Build (or reuse) a TokenExchangeSigner for the current user + tenancy.
+
+    The IAM domain JWT is taken from the active request's access token. The signer
+    self-refreshes the UPST, so we cache it keyed by (tenant alias, token jti) to
+    avoid a token exchange on every tool call and to keep tenancies isolated.
+    """
+    from fastmcp.server.dependencies import get_access_token
+    from oci.auth.signers import TokenExchangeSigner
+
+    access_token = get_access_token()
+    token = access_token.token
+    try:
+        jti = access_token.claims.get("jti")
+    except Exception:
+        jti = None
+    if not jti:
+        jti = str(hash(token))
+
+    cache_key = f"{entry.alias}:{jti}"
+    cached = _oauth_signer_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Newer OCI SDKs take the full domain URL (oci_domain_url); older ones take the
+    # domain id prefix (oci_domain_id). Pick whichever the installed SDK supports.
+    import inspect
+
+    tes_params = inspect.signature(TokenExchangeSigner.__init__).parameters
+    domain_kwargs: dict[str, str] = {}
+    if "oci_domain_url" in tes_params:
+        domain_kwargs["oci_domain_url"] = _domain_to_url(entry.idcs_domain)
+    else:
+        domain_kwargs["oci_domain_id"] = entry.idcs_domain.split(".")[0]
+
+    try:
+        signer = TokenExchangeSigner(
+            jwt_or_func=token,
+            client_id=entry.client_id,
+            client_secret=entry.client_secret,
+            **domain_kwargs,
+        )
+    except Exception as e:
+        # Surface the IAM domain's actual error body instead of a bare
+        # "401 Unauthorized". A 401/403 here almost always means the OCI side is
+        # not set up to exchange the user JWT for a UPST yet: a missing or
+        # misconfigured Identity Propagation Trust, the confidential app missing
+        # the token-exchange/client-credentials grant, or wrong client credentials.
+        # Note: we log the tenancy alias (never the client secret) plus the IAM
+        # error body, which is a diagnostic description and contains no secrets.
+        resp = getattr(e, "response", None)
+        detail = ""
+        if resp is not None:
+            try:
+                detail = f" | IAM {resp.status_code}: {resp.text}"
+            except Exception:
+                pass
+        logger.error(
+            "OCI UPST token exchange failed for tenancy alias=%s%s",
+            entry.alias,
+            detail,
+            exc_info=True,
+        )
+        raise RuntimeError(
+            "OCI UPST token exchange failed. The OCI IAM domain rejected the request to "
+            "exchange the user's token for a UPST. Verify, in this tenancy's IAM domain: "
+            "(1) an Identity Propagation Trust exists that lists this client_id; (2) the "
+            "confidential app has the Authorization Code and Client Credentials grants; "
+            "(3) the registry's client_id/client_secret are correct." + detail
+        ) from e
+
+    with _oauth_signer_lock:
+        if len(_oauth_signer_cache) >= _OAUTH_SIGNER_CACHE_MAX:
+            _oauth_signer_cache.clear()
+        _oauth_signer_cache[cache_key] = signer
+
+    return signer
+
+
+def _oauth_base_config(entry: TenancyEntry, region: str | None = None) -> dict:
+    """Minimal OCI client config for oauth mode (no local OCI config file)."""
+    reg = region or entry.region
+    if not reg:
+        raise ValueError(
+            f"oauth mode requires a region for tenancy '{entry.alias}': set it in the "
+            "registry or pass an explicit region."
+        )
+    user_agent_name = __project__.split("oracle.", 1)[1].split("-server", 1)[0]
+    return {"region": reg, "additional_user_agent": f"{user_agent_name}/{__version__}"}
+
+
+def _effective_region(default: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve the OCI region without requiring a local config file.
+
+    - oauth mode: the authenticated tenancy's region, else default.
+    - session/apikey mode: the configured profile's region, else default.
+    """
+    if _effective_auth_method() == "oauth":
+        try:
+            return _current_tenancy().region or default
+        except Exception:
+            return _first_env("ORACLE_MCP_REGION", "OCI_REGION", default=default)
+    try:
+        return _load_oci_config_for_server().get("region") or default
+    except Exception:
+        return default
+
+
+def _make_client(
+    ctor: Callable[..., Any],
+    region: str | None = None,
+    *,
+    client_name: str,
+    request_id: Optional[str] = None,
+):
+    """
+    Construct and wrap an OCI SDK client using the effective auth method.
+
+    - oauth: minimal regional config + per-request UPST TokenExchangeSigner.
+    - apikey: regional config from ~/.oci/config (SDK uses API key fields).
+    - session: regional config + SecurityTokenSigner from the session token files.
+    """
+    method = _effective_auth_method()
+    if method == "oauth":
+        entry = _current_tenancy()
+        config = _oauth_base_config(entry, region)
+        signer = _build_token_exchange_signer(entry)
+        client = ctor(config, signer=signer)
+    else:
+        config = _load_oci_config_for_server()
+        regional_config = config if region is None else {**config, "region": region}
+        if method == "apikey":
+            client = ctor(regional_config)
+        else:
+            signer = _build_signer_for_session(regional_config)
+            client = ctor(regional_config, signer=signer)
+
+    rid = request_id or uuid.uuid4().hex
+    return _wrap_oci_client(client, request_id=rid, client_name=client_name)
+
+
+def _default_oauth_storage_root() -> str:
+    """Default per-tenant OAuth state location (overridable via env)."""
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    return os.path.join(base_dir, ".oauth_state")
+
+
+def _build_auth_provider():
+    """
+    Build the FastMCP auth provider for oauth mode (returns None otherwise).
+
+    In oauth mode we serve many tenancies behind a single MCP URL via
+    MultiTenantOCIAuth, which builds one OCIProvider (OIDC proxy) per tenancy from
+    the server-side registry. Persistence knobs (consent off, persisted per-tenant
+    signing keys, on-disk client storage, offline_access scope) keep logins sticky
+    so users are not re-prompted on every tool call.
+    """
+    if _effective_auth_method() != "oauth":
+        return None
+
+    registry = _get_registry()
+    base_url = _first_env("ORACLE_MCP_BASE_URL", "MCP_BASE_URL", default="http://localhost:8000")
+    storage_root = _first_env("ORACLE_MCP_OAUTH_STORAGE_DIR", default=_default_oauth_storage_root())
+    redirect_path = _first_env("ORACLE_MCP_OAUTH_REDIRECT_PATH", default="/auth/callback")
+    scopes = (_first_env("ORACLE_MCP_OAUTH_SCOPES", default="openid offline_access") or "").split()
+    require_consent = _env_bool("ORACLE_MCP_OAUTH_REQUIRE_CONSENT", default=False)
+
+    logger.info(
+        "Configuring multi-tenant OCI IAM OAuth (tenancies=%d, base_url=%s, consent=%s)",
+        len(registry),
+        base_url,
+        require_consent,
+    )
+    return MultiTenantOCIAuth(
+        registry,
+        base_url=base_url,
+        storage_root=storage_root,
+        required_scopes=scopes,
+        require_authorization_consent=require_consent,
+        redirect_path=redirect_path,
+    )
+
+
+# Create the FastMCP app that exposes the functions decorated with @mcp.tool.
+# In oauth mode this attaches the OCI IAM OAuth provider; otherwise auth is None.
+mcp = FastMCP(name=__project__, auth=_build_auth_provider())
+
+
 def get_recovery_client(
     region: str | None = None,
     *,
     request_id: Optional[str] = None,
 ) -> oci.recovery.DatabaseRecoveryClient:
     """Create a Recovery Service client using auth selected via env vars."""
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.recovery.DatabaseRecoveryClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.recovery.DatabaseRecoveryClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.recovery.DatabaseRecoveryClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="recovery")
+    return _make_client(
+        oci.recovery.DatabaseRecoveryClient,
+        region,
+        client_name="recovery",
+        request_id=request_id,
+    )
 
 
 def get_identity_client(*, request_id: Optional[str] = None):
-    config, signer = _get_http_config_and_signer()
-    if signer is None:
-        config = _load_oci_config_for_server()
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.identity.IdentityClient(config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.identity.IdentityClient(config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(config)
-        client = oci.identity.IdentityClient(config, **_get_oci_client_kwargs(signer))
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="identity")
+    return _make_client(
+        oci.identity.IdentityClient,
+        None,
+        client_name="identity",
+        request_id=request_id,
+    )
 
 
-def get_database_client(region: str = None, *, request_id: Optional[str] = None):
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.database.DatabaseClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.database.DatabaseClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.database.DatabaseClient(regional_config, **_get_oci_client_kwargs(signer))
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="database")
+def get_database_client(region: str | None = None, *, request_id: Optional[str] = None):
+    return _make_client(
+        oci.database.DatabaseClient,
+        region,
+        client_name="database",
+        request_id=request_id,
+    )
 
 
 def get_work_request_client(region: str | None = None, *, request_id: Optional[str] = None):
     """Create an OCI Work Requests client using auth selected via env vars."""
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.work_requests.WorkRequestClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.work_requests.WorkRequestClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.work_requests.WorkRequestClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="work_requests")
+    return _make_client(
+        oci.work_requests.WorkRequestClient,
+        region,
+        client_name="work_requests",
+        request_id=request_id,
+    )
 
 
 def get_monitoring_client(region: str | None = None, *, request_id: Optional[str] = None):
     logger.info("entering get_monitoring_client")
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.monitoring.MonitoringClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.monitoring.MonitoringClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.monitoring.MonitoringClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="monitoring")
+    return _make_client(
+        oci.monitoring.MonitoringClient,
+        region,
+        client_name="monitoring",
+        request_id=request_id,
+    )
 
 
 def get_limits_client(region: str | None = None, *, request_id: Optional[str] = None):
     """Create an OCI Limits client using auth selected via env vars."""
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.limits.LimitsClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.limits.LimitsClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.limits.LimitsClient(regional_config, **_get_oci_client_kwargs(signer))
-
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="limits")
+    return _make_client(
+        oci.limits.LimitsClient,
+        region,
+        client_name="limits",
+        request_id=request_id,
+    )
 
 
 def get_onesubscription_client(region: str | None = None, *, request_id: Optional[str] = None):
@@ -802,29 +1920,34 @@ def get_onesubscription_client(region: str | None = None, *, request_id: Optiona
     We use this to discover which regions a tenancy is subscribed to for a given service,
     so we can execute compartment-scoped queries across all relevant regions.
     """
-    regional_config, signer = _get_http_config_and_signer(region)
-    if signer is None:
-        config = _load_oci_config_for_server()
-        regional_config = config if region is None else {**config, "region": region}
-    method = _effective_auth_method()
-    if signer is not None:
-        client = oci.onesubscription.SubscribedServiceClient(regional_config, **_get_oci_client_kwargs(signer))
-    elif method == "apikey":
-        client = oci.onesubscription.SubscribedServiceClient(regional_config, **_get_oci_client_kwargs())
-    else:
-        signer = _build_signer_for_session(regional_config)
-        client = oci.onesubscription.SubscribedServiceClient(
-            regional_config, **_get_oci_client_kwargs(signer)
-        )
+    return _make_client(
+        oci.onesubscription.SubscribedServiceClient,
+        region,
+        client_name="onesubscription",
+        request_id=request_id,
+    )
 
-    rid = request_id or uuid.uuid4().hex
-    return _wrap_oci_client(client, request_id=rid, client_name="onesubscription")
+
+# ---------------- Subscribed regions helpers ----------------
+
+def _tenant_cache_key() -> str:
+    """
+    Stable per-tenant key for the in-process caches.
+
+    In the single-hosted oauth deployment one process serves many tenancies, so
+    every in-process cache MUST be partitioned by tenant or one tenant's metadata
+    would leak to another. get_tenancy() returns the per-request tenant OCID
+    (from the verified token in oauth mode, or the local config otherwise).
+    """
+    try:
+        return get_tenancy() or "_default"
+    except Exception:
+        return "_default"
 
 
 _REGION_CACHE: dict[str, Any] = {
-    "fetched_at": 0.0,
     "ttl_seconds": int(os.getenv("ORACLE_MCP_REGION_CACHE_TTL_SECONDS", "3600")),
-    # items: dict[cache_key -> list[str]]
+    # items: dict[tenant_key -> {"regions": list[dict], "fetched_at": float}]
     "items": {},
 }
 
@@ -834,19 +1957,19 @@ def _iam_subscribed_regions_with_status(*, request_id: str) -> list[dict]:
     Returns the tenancy's subscribed regions from IAM (IdentityClient.list_region_subscriptions).
     Output items are: {"region": "<region_name>", "status": "<READY|...>"}.
 
-    Cached in-process for ORACLE_MCP_REGION_CACHE_TTL_SECONDS to avoid repeated IAM calls.
+    Cached in-process for ORACLE_MCP_REGION_CACHE_TTL_SECONDS, partitioned per tenant.
     """
     now = time.time()
     ttl = float(_REGION_CACHE.get("ttl_seconds") or 3600)
-    items = _REGION_CACHE.get("items") or {}
+    items = _REGION_CACHE.setdefault("items", {})
 
-    cache_key = "iam:list_region_subscriptions"
-    fetched_at = float(_REGION_CACHE.get("fetched_at") or 0.0)
-    if cache_key in items and (now - fetched_at) < ttl:
-        return items.get(cache_key) or []
+    tenancy_id = get_tenancy()
+    cache_key = f"iam:list_region_subscriptions:{tenancy_id}"
+    cached = items.get(cache_key)
+    if cached and (now - float(cached.get("fetched_at") or 0.0)) < ttl:
+        return cached.get("regions") or []
 
     identity = get_identity_client(request_id=request_id)
-    tenancy_id = get_tenancy()
     resp = identity.list_region_subscriptions(tenancy_id=tenancy_id)
     subs = getattr(resp, "data", None) or []
 
@@ -858,18 +1981,21 @@ def _iam_subscribed_regions_with_status(*, request_id: str) -> list[dict]:
             out.append({"region": region_name, "status": status})
 
     out = sorted(out, key=lambda x: x.get("region") or "")
-    items[cache_key] = out
-    _REGION_CACHE["items"] = items
-    _REGION_CACHE["fetched_at"] = now
+    items[cache_key] = {"regions": out, "fetched_at": now}
     return out
 
 
 def get_tenancy():
-    # Return the tenancy OCID from config unless overridden by TENANCY_ID_OVERRIDE
-    tenancy_id = os.getenv("TENANCY_ID_OVERRIDE") or _get_profile_value("tenancy")
-    if not tenancy_id:
-        raise RuntimeError("Tenancy lookup requires TENANCY_ID_OVERRIDE or an OCI config file tenancy.")
-    return tenancy_id
+    # oauth mode: the tenancy is bound to the authenticated user's token (the
+    # X-OCI-Tenancy header selects it at login; the verified claim is authoritative).
+    if _effective_auth_method() == "oauth":
+        return _current_tenancy().tenancy_id
+    # session/apikey: explicit override, else the local OCI config's tenancy.
+    override = _first_env("TENANCY_ID_OVERRIDE", "ORACLE_MCP_TENANCY_ID")
+    if override:
+        return override
+    config = _load_oci_config_for_server()
+    return config["tenancy"]
 
 
 def list_all_compartments_internal(only_one_page: bool, limit=100):
@@ -902,10 +2028,12 @@ def list_all_compartments_internal(only_one_page: bool, limit=100):
     return compartments
 
 
+# ---------------- Nested compartment helpers ----------------
+
 _COMPARTMENT_CACHE: dict[str, Any] = {
-    "fetched_at": 0.0,
     "ttl_seconds": int(os.getenv("ORACLE_MCP_COMPARTMENT_CACHE_TTL_SECONDS", "300")),
-    "items": None,  # type: ignore
+    # entries: dict[tenant_key -> {"items": list[Any], "fetched_at": float}]
+    "entries": {},
 }
 
 
@@ -922,11 +2050,12 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
     """
     now = time.time()
     ttl = float(_COMPARTMENT_CACHE.get("ttl_seconds") or 300)
-    items = _COMPARTMENT_CACHE.get("items")
-    fetched_at = float(_COMPARTMENT_CACHE.get("fetched_at") or 0.0)
+    entries = _COMPARTMENT_CACHE.setdefault("entries", {})
+    tenant_key = _tenant_cache_key()
+    cached = entries.get(tenant_key)
 
-    if items and (now - fetched_at) < ttl:
-        return items  # type: ignore[return-value]
+    if cached and cached.get("items") and (now - float(cached.get("fetched_at") or 0.0)) < ttl:
+        return cached["items"]  # type: ignore[return-value]
 
     rid = request_id or uuid.uuid4().hex
 
@@ -971,8 +2100,7 @@ def _list_all_compartments_cached(*, request_id: Optional[str] = None) -> list[A
         )
         comps = []
 
-    _COMPARTMENT_CACHE["items"] = comps
-    _COMPARTMENT_CACHE["fetched_at"] = now
+    entries[tenant_key] = {"items": comps, "fetched_at": now}
     return comps
 
 
@@ -1368,12 +2496,13 @@ def get_compartment_by_name_tool(
 
 @mcp.tool(
     description=(
-        "Lists protected databases in a compartment with optional filters. The "
-        "compartment input may be either a compartment OCID or a compartment display "
-        "name. For each database it also includes Recovery Service Subnet details, "
-        "removes noisy fields, and adds basic per‑database metrics. The result is a "
-        "list of simple dictionaries, each with cleaned subnet information and a "
-        "small metrics map."
+        "Lists protected databases in a compartment with optional filters. For each "
+        "database it also includes Recovery Service Subnet details, removes noisy "
+        "fields, and adds basic per‑database metrics. It also includes "
+        "policyLockedDateTime so retention-lock status is clear (null means lock "
+        "is disabled for the attached protection policy; a timestamp means lock "
+        "is configured/effective). The result is a list of simple dictionaries, "
+        "each with cleaned subnet information and a small metrics map."
     )
 )
 @_tool_logger("list_protected_databases")
@@ -1776,9 +2905,8 @@ def get_protected_database(
 @mcp.tool(
     description=(
         "Shows how many protected databases are healthy, warning, alert, or unknown "
-        "in a compartment. The compartment input may be either a compartment OCID or "
-        "a compartment display name. If a quick list doesn’t include health, it checks "
-        "each database to fill it in. The result is a small JSON with the counts, the "
+        "in a compartment. If a quick list doesn’t include health, it checks each "
+        "database to fill it in. The result is a small JSON with the counts, the "
         "compartmentId, and the region."
     )
 )
@@ -1962,9 +3090,9 @@ def summarize_protected_database_health(
 
 @mcp.tool(
     description=(
-        "Shows how many protected databases have redo transport turned on or off in "
-        "a compartment. The compartment input may be either a compartment OCID or a "
-        "compartment display name. It reads the main setting and uses a fallback when "
+        "Use this tool for real-time protection status questions. It shows how many "
+        "protected databases have redo transport (real-time protection) turned on or "
+        "off in a compartment. It reads the main setting and uses a fallback when "
         "needed. The result is a simple JSON with enabled, disabled, total, the "
         "compartmentId, and the region."
     )
@@ -2131,10 +3259,9 @@ def summarize_protected_database_redo_status(
     description=(
         "Adds up the backup space (in GB) used by protected databases in a compartment, "
         "including only those with lifecycle state ACTIVE or DELETE_SCHEDULED (excluding "
-        "DELETED). The compartment input may be either a compartment OCID or a "
-        "compartment display name. It reads each database’s metrics and also tells you "
-        "how many databases were checked. The result is a small JSON with the "
-        "compartmentId, region, totalDatabasesScanned, and the total space in GB."
+        "DELETED). It reads each database’s metrics and also tells you how many databases "
+        "were checked. The result is a small JSON with the compartmentId, region, "
+        "totalDatabasesScanned, and the total space in GB."
     )
 )
 @_tool_logger("summarize_backup_space_used")
@@ -2364,9 +3491,8 @@ def check_recovery_service_limits(
     """
     try:
         request_id = uuid.uuid4().hex
-        config = _load_oci_config_for_server()
         resolved_compartment_id = get_tenancy()
-        target_region = (config.get("region") or "us-ashburn-1").strip()
+        target_region = (_effective_region("us-ashburn-1") or "us-ashburn-1").strip()
         client = get_limits_client(target_region, request_id=request_id)
 
         service_name = "autonomous-recovery-service"
@@ -2455,9 +3581,7 @@ def fetch_regions_subscribed(
 @mcp.tool(
     description=(
         "Lists protection policies in a compartment with handy filters and automatic "
-        "paging. The compartment input may be either a compartment OCID or a "
-        "compartment display name. The result is a straightforward list of "
-        "protection policies."
+        "paging. The result is a straightforward list of protection policies."
     )
 )
 @_tool_logger("list_protection_policies")
@@ -2588,11 +3712,10 @@ def get_protection_policy(
 
 @mcp.tool(
     description=(
-        "Lists recovery service subnets in a compartment with helpful filters. The "
-        "compartment input may be either a compartment OCID or a compartment display "
-        "name. When needed, it fills in the list of associated subnets or uses the "
-        "subnet_id as a fallback. The result is a simple list of subnets with the "
-        "subnets list included when available."
+        "Lists recovery service subnets in a compartment with helpful filters. When "
+        "needed, it fills in the list of associated subnets or uses the subnet_id as "
+        "a fallback. The result is a simple list of subnets with the subnets list "
+        "included when available."
     )
 )
 @_tool_logger("list_recovery_service_subnets")
@@ -2765,11 +3888,10 @@ def get_recovery_service_subnet(
 
 @mcp.tool(
     description=(
-        "Fetches Recovery Service metrics for a time range. The compartment input may "
-        "be either a compartment OCID or a compartment display name. You choose the "
-        "metric, time step, and how to combine values, and you can limit it to one "
-        "protected database. The result is a simple time series where each item has "
-        "dimensions and a list of {timestamp, value} points."
+        "Fetches Recovery Service metrics for a time range. You choose the metric, "
+        "time step, and how to combine values, and you can limit it to one protected "
+        "database. The result is a simple time series where each item has dimensions "
+        "and a list of {timestamp, value} points."
     )
 )
 @_tool_logger("get_recovery_service_metrics")
@@ -2855,11 +3977,10 @@ def get_recovery_service_metrics(
 @mcp.tool(
     description=(
         "Lists databases in a DB Home or, if none is given, across all DB Homes in a "
-        "compartment. The compartment input may be either a compartment OCID or a "
-        "compartment display name. It can find DB Homes for you, fills in backup "
-        "settings only when needed, and, where possible, links each database to its "
-        "protection policy. The result is a list of database summaries with optional "
-        "backup settings and protection policy ID."
+        "compartment. It can find DB Homes for you, fills in backup settings only when "
+        "needed, and, where possible, links each database to its protection policy. "
+        "The result is a list of database summaries with optional backup settings and "
+        "protection policy ID."
     )
 )
 @_tool_logger("list_databases")
@@ -3224,11 +4345,10 @@ def list_restore(
     description=(
         "Lists database backups with flexible filters and optional auto-paging. If "
         "database_id is provided, lists all backups for that database. If compartment_id "
-        "is provided, it may be either a compartment OCID or a compartment display name, "
-        "and the tool finds AVAILABLE databases with auto-backup enabled and lists "
-        "their backups. It includes manual backups, automatic backups and LTR backups "
-        "as well. It adds helpful fields like backup destination, database's unique "
-        "name. The result is a list of easy-to-read backup summaries."
+        "is provided, finds AVAILABLE databases with auto-backup enabled and lists their "
+        "backups. It includes manual backups, automatic backups and LTR backups as well. "
+        "It adds helpful fields like backup destination, database's unique name. The "
+        "result is a list of easy-to-read backup summaries."
     )
 )
 @_tool_logger("list_backups")
@@ -3636,12 +4756,11 @@ def get_backup(
 
 @mcp.tool(
     description=(
-        "Summarizes how databases in a compartment or DB Home are backed up. The "
-        "compartment input may be either a compartment OCID or a compartment display "
-        "name. It can find DB Homes, looks at each database’s backup settings, can "
-        "include the time of the most recent backup, and groups results by destination "
-        "type while calling out databases that aren’t configured. The result is one "
-        "summary object with counts, name lists, and per‑database details."
+        "Summarizes how databases in a compartment or DB Home are backed up. It can "
+        "find DB Homes, looks at each database’s backup settings, can include the time "
+        "of the most recent backup, and groups results by destination type while calling "
+        "out databases that aren’t configured. The result is one summary object with "
+        "counts, name lists, and per‑database details."
     )
 )
 @_tool_logger("summarize_protected_database_backup_destination")
@@ -4020,9 +5139,8 @@ def summarize_protected_database_backup_destination(
 @mcp.tool(
     description=(
         "Lists database homes in a compartment with optional lifecycle filters, "
-        "defaulting to your tenancy when no compartment is given. The compartment "
-        "input may be either a compartment OCID or a compartment display name. It "
-        "handles paging for you and returns a list of database home summaries."
+        "defaulting to your tenancy when no compartment is given, and handles paging "
+        "for you. The result is a list of database home summaries."
     )
 )
 @_tool_logger("list_db_homes")
@@ -4116,9 +5234,8 @@ def get_db_home(
 @mcp.tool(
     description=(
         "Lists database systems in a compartment with optional lifecycle filters, "
-        "defaulting to your tenancy when no compartment is given. The compartment "
-        "input may be either a compartment OCID or a compartment display name. It "
-        "handles paging for you and returns a list of database system summaries."
+        "defaulting to your tenancy when no compartment is given, and handles paging "
+        "for you. The result is a list of database system summaries."
     )
 )
 @_tool_logger("list_db_systems")
@@ -4207,51 +5324,150 @@ def get_db_system(
         raise
 
 
-@mcp.prompt(
-    name="oci_recovery_service_dashboard_prompt",
-    description="Returns the OCI Recovery Service Dashboard prompt.",
+@mcp.tool(
+    description=(
+        "Returns dashboard-generation guidance for OCI Recovery Service, including "
+        "cloud-protected databases."
+    )
 )
-def oci_recovery_service_dashboard_prompt():
-    return [{"role": "system", "content": OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT}]
+def oci_recovery_service_dashboard_prompt() -> str:
+    """Return dashboard-generation guidance as a tool for clients without prompt support."""
+    return OCI_RECOVERY_SERVICE_DASHBOARD_PROMPT
+
+
+@mcp.tool(
+    description=(
+        "Returns readiness-assessment and onboarding guidance for an on-premises "
+        "Oracle Database using Cloud Protect."
+    )
+)
+def onboard_database_with_cloud_protect() -> str:
+    """Return Cloud Protect onboarding guidance without inspecting or changing an environment."""
+    return CLOUD_PROTECT_ONBOARDING_PROMPT
+
+
+@mcp.tool(
+    name="OutofplaceRestoreOfDatabase",
+    description=(
+        "CDB Out-of-Place Recovery to an Alternate Location Using RCV and RMAN\n"
+        "Use this procedure when an Oracle Multitenant Container Database (CDB) must be "
+        "recovered to a different location.\n\n"
+        "Typical scenarios include:\n\n"
+        "Recovering the database after the source cluster has been lost or deleted due "
+        "to a disaster.\n"
+        "Creating an alternate database environment for testing, reporting, or auditing "
+        "purposes."
+    ),
+)
+def outofplace_restore_of_database(
+    source_database_name: Annotated[str, "Source CDB database name"],
+    target_database_address: Annotated[str, "Target database host address or IP address"],
+    protected_database_ocid: Annotated[str, "Recovery Service protected database OCID"],
+    source_database_address: Annotated[
+            Optional[str], "Source database host address or IP address"
+    ] = None,
+    connection_details: Annotated[
+        Optional[str], "Approved source and target connection details supplied by the operator"
+    ] = None,
+) -> str:
+    """Return a populated disaster-recovery runbook prompt without running recovery operations."""
+    validation_errors = _validate_outofplace_restore_inputs(
+        source_database_address=source_database_address,
+        source_database_name=source_database_name,
+        target_database_address=target_database_address,
+        protected_database_ocid=protected_database_ocid,
+    )
+    if validation_errors:
+        return "Cannot populate the recovery runbook. Correct these inputs and try again:\n- " + (
+            "\n- ".join(validation_errors)
+        )
+
+    replacements = {
+        "<source database address>": source_database_address
+        or "Not provided; request the source database address before execution.",
+        "<source database name>": source_database_name,
+        "<target database address>": target_database_address,
+        "<ocid of recovery service protected databases>": protected_database_ocid,
+        "<connection details>": connection_details
+        or "No connection details supplied; request approved connection details before execution.",
+    }
+    prompt = OUT_OF_PLACE_RESTORE_OF_DATABASE_PROMPT
+    for placeholder, value in replacements.items():
+        prompt = prompt.replace(placeholder, value)
+    return prompt
+
+
+_OCID_PATTERN = re.compile(
+    r"^ocid1\.[a-z][a-z0-9-]*\.[a-z0-9-]+\.(?:[a-z0-9-]*\.)?[A-Za-z0-9_-]+$"
+)
+
+
+def _validate_outofplace_restore_inputs(
+    *,
+    source_database_address: Optional[str],
+    source_database_name: str,
+    target_database_address: str,
+    protected_database_ocid: str,
+) -> list[str]:
+    """Validate values before inserting them into the recovery runbook prompt."""
+    errors: list[str] = []
+    for field_name, address in (
+        ("source_database_address", source_database_address),
+        ("target_database_address", target_database_address),
+    ):
+        if address is None and field_name == "source_database_address":
+            continue
+        if not isinstance(address, str):
+            errors.append(f"{field_name} must be an IP address.")
+            continue
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            errors.append(f"{field_name} must be an IP address.")
+
+    if (
+        not isinstance(source_database_name, str)
+        or not source_database_name
+        or len(source_database_name) >= 32
+        or any(character.isspace() for character in source_database_name)
+    ):
+        errors.append(
+            "source_database_name must be a single string with fewer than 32 characters."
+        )
+
+    if not isinstance(protected_database_ocid, str) or not _OCID_PATTERN.fullmatch(
+        protected_database_ocid
+    ):
+        errors.append("protected_database_ocid must be a valid OCI OCID.")
+
+    return errors
 
 
 def main():
     # Entrypoint: choose transport based on env; always log startup meta and log file location
     host = os.getenv("ORACLE_MCP_HOST")
     port = os.getenv("ORACLE_MCP_PORT")
+    method = _effective_auth_method()
 
     # Log startup and where logs are written
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     log_dir = os.getenv("ORACLE_MCP_LOG_DIR", os.path.join(base_dir, "logs"))
     log_file = os.getenv("ORACLE_MCP_LOG_FILE", os.path.join(log_dir, "oci_recovery_mcp_server.log"))
-    logger.info("Starting %s v%s", __project__, __version__)
+    logger.info("Starting %s v%s (auth_method=%s)", __project__, __version__, method)
     logger.info("Logs will be written to: %s", os.path.abspath(log_file))
 
-    if not (host and port):
+    if method == "oauth":
+        # OAuth / UPST token exchange is served over the streamable HTTP transport.
+        oauth_host = host or "127.0.0.1"
+        oauth_port = int(port or "8000")
+        logger.info("Running FastMCP over streamable HTTP with OCI IAM OAuth at http://%s:%s", oauth_host, oauth_port)
+        mcp.run(transport="http", host=oauth_host, port=oauth_port)
+    elif host and port:
+        logger.info("Running FastMCP over HTTP at http://%s:%s", host, port)
+        mcp.run(transport="http", host=host, port=int(port))
+    else:
         logger.info("Running FastMCP over stdio transport")
         mcp.run()
-        return
-    logger.info("Running FastMCP over HTTP at http://%s:%s", host, port)
-    domain = os.getenv("IDCS_DOMAIN")
-    client_id = os.getenv("IDCS_CLIENT_ID")
-    client_secret = os.getenv("IDCS_CLIENT_SECRET")
-    base_url = os.getenv("ORACLE_MCP_BASE_URL", "")
-    audience = os.getenv("IDCS_AUDIENCE")
-    if not all((domain, client_id, client_secret, audience, base_url)):
-        raise RuntimeError(
-            "HTTP transport requires IDCS authentication. "
-            "Set IDCS_DOMAIN, IDCS_CLIENT_ID, IDCS_CLIENT_SECRET, IDCS_AUDIENCE, "
-            "ORACLE_MCP_BASE_URL, ORACLE_MCP_HOST, and ORACLE_MCP_PORT."
-        )
-    mcp.auth = OCIProvider(
-        config_url=f"https://{domain}/.well-known/openid-configuration",
-        client_id=client_id,
-        client_secret=client_secret,
-        audience=audience,
-        required_scopes=parse_scopes(os.getenv("IDCS_REQUIRED_SCOPES")) or f"openid profile email oci_mcp.{__project__.removeprefix('oracle.oci-').removesuffix('-mcp-server').replace('-', '_')}.invoke".split(),
-        base_url=base_url,
-    )
-    mcp.run(transport="http", host=host, port=int(port))
 
 
 if __name__ == "__main__":

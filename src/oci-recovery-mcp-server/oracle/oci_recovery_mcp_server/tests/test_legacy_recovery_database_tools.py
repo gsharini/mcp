@@ -174,6 +174,7 @@ class TestRecoveryDatabaseTools:
         assert result[0]["id"] == "wr1"
         assert result[0]["operation_type"] == "Restore Database"
 
+ 
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_summarize_protected_database_backup_destination(self, mock_get_db_client):
@@ -551,3 +552,4 @@ class TestRecoveryDatabaseTools:
         # Dedup should collapse the duplicate home1 from two compartments to one
         assert len(result) == 1
         assert result[0]["id"] == "home1"
+
