@@ -44,6 +44,14 @@ itself, which removes four local settings and requires one new one.
   under each tenancy's mount, so the registered redirect URI
   `<base_url>/t/<alias>/auth/callback` is unchanged.
 
+### Added
+
+- **New `diagnose_recovery_service_issue` guidance tool.** Returns an
+  evidence-driven, access-first diagnostic workflow for investigating Oracle
+  Database backup, protection, and recoverability problems in a Recovery Service
+  environment. Like the other guidance tools, it exposes the prompt text as an
+  ordinary tool so clients without prompt support can call it.
+
 ### Changed
 
 - **CIMD client registration is disabled.** FastMCP enables Client ID Metadata
@@ -108,6 +116,13 @@ itself, which removes four local settings and requires one new one.
   indicator a client sends is the one the provider validates and the one the tokens
   it issues are bound to. Tokens issued by 3.0.0 carry the old audience and are
   rejected; affected clients sign in again.
+- **Multi-tenant OAuth discovery is no longer cacheable across tenancies.** The
+  single `/.well-known/oauth-protected-resource/mcp` endpoint selects its answer
+  from the `X-OCI-Tenancy` request header but declared no `Vary` and no cache
+  directives, so a shared cache could serve one tenancy the authorization server
+  of another. Every response from that endpoint -- including the `400` and the
+  CORS preflight -- now carries `Vary: X-OCI-Tenancy`, `Cache-Control: no-store,
+  private`, and `Pragma: no-cache`.
 
 ## 3.0.0
 

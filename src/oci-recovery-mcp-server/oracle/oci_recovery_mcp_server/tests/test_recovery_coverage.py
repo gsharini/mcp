@@ -2243,3 +2243,7 @@ def test_database_list_branches_and_tool_error_paths(monkeypatch):
         server.onboard_database_to_recovery_service()
         == server.ONBOARD_DATABASE_TO_RECOVERY_SERVICE_PROMPT
     )
+    assert (
+        server.diagnose_recovery_service_issue()
+        == server.DIAGNOSE_RECOVERY_SERVICE_ISSUE_PROMPT
+    )

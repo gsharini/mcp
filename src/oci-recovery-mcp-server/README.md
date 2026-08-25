@@ -377,7 +377,7 @@ Most resource tools accept `region` where the OCI API supports it. The supported
 | Protected databases | `list_protected_databases`, `get_protected_database`, `summarize_protected_database_health`, `summarize_protected_database_redo_status`, `summarize_backup_space_used` |
 | Recovery Service | `check_recovery_service_limits`, `fetch_regions_subscribed`, `list_protection_policies`, `get_protection_policy`, `list_recovery_service_subnets`, `get_recovery_service_subnet`, `get_recovery_service_metrics`, `list_restore` |
 | Database Service and backups | `list_databases`, `get_database`, `list_backups`, `get_backup`, `summarize_protected_database_backup_destination`, `list_db_homes`, `get_db_home`, `list_db_systems`, `get_db_system` |
-| Guidance | `oci_recovery_service_dashboard_prompt`, `onboard_database_to_recovery_service` |
+| Guidance | `oci_recovery_service_dashboard_prompt`, `onboard_database_to_recovery_service`, `diagnose_recovery_service_issue` |
 
 Use the MCP tool descriptions as the authoritative parameter reference. Some list tools can resolve a compartment display name; OCI resource retrieval tools require the corresponding OCID.
 

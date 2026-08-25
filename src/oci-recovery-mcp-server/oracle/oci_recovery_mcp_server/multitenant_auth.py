@@ -24,6 +24,9 @@ https://oss.oracle.com/licenses/upl.
 #     resource/mcp) reads the X-OCI-Tenancy header and points the client at that
 #     tenancy's authorization server, so the browser login auto-routes. If the
 #     header is missing/unknown it returns an actionable 400 listing valid aliases.
+#     One URL answering differently per header is only safe if nothing caches it
+#     under the URL alone, so every response from it is marked Vary + no-store
+#     (see _NO_SHARED_CACHE).
 #   * Token verification tries each tenancy's verifier; the one whose signing key
 #     matches wins (verification never trusts the header). The verified token is
 #     stamped with the `oracle_mcp_tenant_alias` claim so tool routing is bound to
@@ -60,6 +63,30 @@ from .tenancy_registry import RegistryError, TenancyEntry, TenancyRegistry
 logger = get_logger(__name__)
 
 TENANT_CLAIM = "oracle_mcp_tenant_alias"
+
+# The name of the routing header, in one place: it is read on two paths (OAuth
+# discovery and token verification) and must be declared to caches on the first.
+TENANCY_HEADER = "X-OCI-Tenancy"
+
+# Protected-resource metadata is one URL whose body is chosen by a request header,
+# which makes an unqualified cache entry a cross-tenancy fault: the second caller
+# is handed the first caller's authorization server and is walked through login
+# against a tenancy that is not theirs. No token is forged that way -- verification
+# still only accepts a token the tenancy's own signing key validates -- but the
+# user lands in the wrong place with an unexplainable error, or authenticates
+# somewhere they did not intend to.
+#
+# `Vary` states the dependency for caches that honor it. `no-store` and `private`
+# cover the ones that cannot: an intermediary that strips or never forwards an
+# unknown request header has no way to key on it correctly no matter what `Vary`
+# says. Nothing is lost by refusing storage -- the body is a few hundred bytes and
+# a client fetches it once per session -- and `Pragma` is the HTTP/1.0 spelling,
+# sent for the same reason RFC 6749 sends it on the token endpoint.
+_NO_SHARED_CACHE = {
+    "Vary": TENANCY_HEADER,
+    "Cache-Control": "no-store, private",
+    "Pragma": "no-cache",
+}
 
 # Scopes IDCS defines itself, which are never namespaced by a resource application.
 # Everything else in ORACLE_MCP_OAUTH_SCOPES belongs to this server's resource
@@ -303,7 +330,7 @@ class MultiTenantOCIAuth(AuthProvider):
         try:
             from fastmcp.server.dependencies import get_http_headers
 
-            hint = (get_http_headers() or {}).get("x-oci-tenancy")
+            hint = (get_http_headers() or {}).get(TENANCY_HEADER.lower())
         except Exception:
             hint = None
         hint = hint.strip() if hint else ""
@@ -377,10 +404,18 @@ class MultiTenantOCIAuth(AuthProvider):
     # -- handlers -------------------------------------------------------------
 
     async def _protected_resource_metadata(self, request: Request) -> Response:
-        if request.method == "OPTIONS":
-            return Response(status_code=204)
+        """Answer discovery for the tenancy named by the header, uncacheably.
 
-        hint = request.headers.get("x-oci-tenancy")
+        Which tenancy this describes -- and whether it describes one at all -- is
+        decided by a request header, so every exit from this handler must carry
+        _NO_SHARED_CACHE. That includes the 400 and the OPTIONS reply: a stored
+        "no valid tenancy" answer is as wrong for the next caller as a stored
+        answer naming the wrong one.
+        """
+        if request.method == "OPTIONS":
+            return Response(status_code=204, headers=_NO_SHARED_CACHE)
+
+        hint = request.headers.get(TENANCY_HEADER)
         entry = self._registry.lookup(hint)
 
         if entry is None and not hint and len(self._registry) == 1:
@@ -416,12 +451,13 @@ class MultiTenantOCIAuth(AuthProvider):
                 {
                     "error": "tenancy_required",
                     "error_description": (
-                        "Set the 'X-OCI-Tenancy' header (tenancy OCID or alias) to one of: "
+                        f"Set the '{TENANCY_HEADER}' header (tenancy OCID or alias) to one of: "
                         + ", ".join(sorted(self._registry.aliases))
                     ),
                     "valid_tenancies": sorted(self._registry.aliases),
                 },
                 status_code=400,
+                headers=_NO_SHARED_CACHE,
             )
 
         return JSONResponse(
@@ -433,7 +469,8 @@ class MultiTenantOCIAuth(AuthProvider):
                 # bare resource scopes are rejected at /authorize.
                 "scopes_supported": self._client_scopes[entry.alias],
                 "bearer_methods_supported": ["header"],
-            }
+            },
+            headers=_NO_SHARED_CACHE,
         )
 
     async def _tenancies_page(self, request: Request) -> HTMLResponse:

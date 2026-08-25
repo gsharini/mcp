@@ -17,7 +17,11 @@ from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials
 
 from oracle.oci_recovery_mcp_server import server
-from oracle.oci_recovery_mcp_server.multitenant_auth import TENANT_CLAIM, MultiTenantOCIAuth
+from oracle.oci_recovery_mcp_server.multitenant_auth import (
+    TENANCY_HEADER,
+    TENANT_CLAIM,
+    MultiTenantOCIAuth,
+)
 from oracle.oci_recovery_mcp_server.tenancy_registry import RegistryError, TenancyRegistry
 
 HOST = "https://mcp.example.com"
@@ -424,6 +428,76 @@ class TestRoutes:
             assert r.status_code != 404
             r = await client.get("/tenancies")
             assert r.status_code == 200 and "t1" in r.text and "t2" in r.text
+
+
+class TestDiscoveryIsNotCacheable:
+    """One URL, a body chosen by a header: nothing may store it under the URL alone."""
+
+    @staticmethod
+    def _assert_uncacheable(response):
+        # Vary for caches that honor it; no-store/private for the intermediaries
+        # that never forward an unknown header and so cannot key on it at all.
+        assert TENANCY_HEADER.lower() in response.headers["vary"].lower()
+        cache_control = response.headers["cache-control"].lower()
+        assert "no-store" in cache_control
+        assert "private" in cache_control
+        assert response.headers["pragma"] == "no-cache"
+
+    @pytest.mark.asyncio
+    async def test_every_discovery_response_forbids_shared_caching(self, auth):
+        # Without this a shared cache serves t2 the answer it stored for t1, and the
+        # user is walked through login against a tenancy that is not theirs.
+        app = Starlette(routes=auth.get_routes(mcp_path="/mcp"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=HOST) as client:
+            for headers in (
+                {TENANCY_HEADER: "t1"},  # 200, names t1
+                {TENANCY_HEADER: "nope"},  # 400, unknown tenancy
+                {},  # 400, ambiguous with two tenancies
+            ):
+                r = await client.get(
+                    "/.well-known/oauth-protected-resource/mcp", headers=headers
+                )
+                self._assert_uncacheable(r)
+
+            # The CORS preflight short-circuit returns before the registry lookup
+            # and would otherwise be the one uncovered exit.
+            r = await client.options("/.well-known/oauth-protected-resource/mcp")
+            assert r.status_code == 204
+            self._assert_uncacheable(r)
+
+    @pytest.mark.asyncio
+    async def test_cors_wrapper_does_not_drop_the_vary_header(self, auth):
+        # The handler is wrapped in cors_middleware, which rewrites response headers
+        # on any request carrying an Origin. If that clobbered Vary the directive
+        # would be silently absent for exactly the browser clients that need it.
+        app = Starlette(routes=auth.get_routes(mcp_path="/mcp"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=HOST) as client:
+            r = await client.get(
+                "/.well-known/oauth-protected-resource/mcp",
+                headers={TENANCY_HEADER: "t1", "Origin": "https://client.example.com"},
+            )
+            assert r.status_code == 200
+            self._assert_uncacheable(r)
+
+    @pytest.mark.asyncio
+    async def test_the_two_tenancies_really_do_get_different_bodies(self, auth):
+        # The premise of the whole class: if the answers were identical there would
+        # be nothing to cache wrongly, and these directives could be dropped.
+        app = Starlette(routes=auth.get_routes(mcp_path="/mcp"))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url=HOST) as client:
+            bodies = [
+                (
+                    await client.get(
+                        "/.well-known/oauth-protected-resource/mcp",
+                        headers={TENANCY_HEADER: alias},
+                    )
+                ).json()
+                for alias in ("t1", "t2")
+            ]
+        assert bodies[0]["authorization_servers"] != bodies[1]["authorization_servers"]
 
 
 class TestVerifyTokenStamping:
