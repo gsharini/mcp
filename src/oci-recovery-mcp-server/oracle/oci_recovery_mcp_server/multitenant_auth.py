@@ -37,11 +37,20 @@ https://oss.oracle.com/licenses/upl.
 # build_idcs_http_auth() / IDCSHttpAuth.context_for(); this module only decides
 # which tenancy a request belongs to and composes the per-tenancy routes.
 #
-# Per-tenancy isolation (matching the old one-process-per-tenancy deployment) is
-# preserved by the shared builder rather than configured here: FastMCP derives both
-# the token signing key and the encrypted OAuth-state directory from the upstream
-# client secret, which differs per tenancy, so no tenancy can read another's state
-# and keys stay stable across restarts and workers.
+# Per-tenancy isolation here is cryptographic and state-level, not process-level.
+# It comes from the shared builder rather than being configured here: FastMCP
+# derives both the token signing key and the encrypted OAuth-state directory from
+# the upstream client secret, which differs per tenancy. So no tenancy can read
+# another's state, keys stay stable across restarts and workers, and a token is
+# only ever accepted by the tenancy whose key verifies it.
+#
+# What this deployment does NOT preserve -- unlike the one-process-per-tenancy
+# arrangement it replaces -- is blast radius. This process loads every tenancy's
+# client secret, instantiates every proxy, mounts every tenancy's routes, and
+# holds every tenancy's token state and exchanges. That is namespacing, not
+# containment: a compromise of this process exposes every configured tenancy.
+# It is the cost of serving them all from one URL, and it is worth weighing
+# before adding a tenancy whose exposure would be unacceptable alongside the rest.
 
 from __future__ import annotations
 
