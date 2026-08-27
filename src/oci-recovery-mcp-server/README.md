@@ -97,7 +97,7 @@ environment and runs its entry point.
 uvx oracle.oci-recovery-mcp-server
 ```
 
-To pin a version, use `uvx oracle.oci-recovery-mcp-server@3.1.0`.
+To pin a version, use `uvx oracle.oci-recovery-mcp-server@3.0.0`.
 
 ```json
 {
