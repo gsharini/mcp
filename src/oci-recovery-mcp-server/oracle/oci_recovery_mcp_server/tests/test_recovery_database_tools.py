@@ -14,9 +14,19 @@ from oracle.oci_recovery_mcp_server.server import mcp
 
 
 class TestRecoveryDatabaseTools:
+    """
+    The Database-service tools driven end to end through a FastMCP client, so each
+    assertion covers the JSON a real client receives rather than the tool's return
+    value alone.
+    """
+
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_list_databases(self, mock_get_db_client):
+        """
+        Listing databases in an explicit DB Home returns the mapped database, with
+        db_backup_config filled in by the follow-up GET the summary omitted.
+        """
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -57,6 +67,11 @@ class TestRecoveryDatabaseTools:
     async def test_get_database_sets_protection_policy(
         self, mock_get_db_client, mock_get_rec_client
     ):
+        """
+        get_database enriches the result with the protection policy found by
+        correlating the database against Recovery Service protected databases in its
+        compartment.
+        """
         db_client = MagicMock()
         rec_client = MagicMock()
         mock_get_db_client.return_value = db_client
@@ -90,6 +105,10 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_list_backups(self, mock_get_db_client):
+        """
+        Listing backups for one database returns the mapped backups, each carrying the
+        database's unique name from the follow-up lookup.
+        """
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -118,6 +137,7 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_get_backup(self, mock_get_db_client):
+        """get_backup returns the mapped backup enriched with the database's unique name."""
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -148,6 +168,10 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_work_request_client")
     async def test_list_restore(self, mock_get_wr_client):
+        """
+        list_restore keeps only restore work requests, dropping the other operation
+        types the compartment's work request list contains.
+        """
         mock_client = MagicMock()
         mock_get_wr_client.return_value = mock_client
 
@@ -177,6 +201,11 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_summarize_protected_database_backup_destination(self, mock_get_db_client):
+        """
+        The destination summary counts every database, groups the configured ones by
+        canonical destination type (RECOVERY_SERVICE reported as DBRS), and counts the
+        rest as unconfigured while still listing them.
+        """
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -220,6 +249,7 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_list_db_homes(self, mock_get_db_client):
+        """Listing DB Homes in a compartment returns the mapped home summaries."""
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -245,6 +275,7 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_get_db_home(self, mock_get_db_client):
+        """get_db_home returns the mapped DB Home."""
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -264,6 +295,7 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_list_db_systems(self, mock_get_db_client):
+        """Listing DB Systems in a compartment returns the mapped system summaries."""
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -289,6 +321,7 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_database_client")
     async def test_get_db_system(self, mock_get_db_client):
+        """get_db_system returns the mapped DB System."""
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -312,6 +345,10 @@ class TestRecoveryDatabaseTools:
     async def test_list_databases_compartment_only_discovers_homes(
         self, mock_get_db_client, mock_fetch_homes, mock_get_rec_client
     ):
+        """
+        Given a compartment and no DB Home, list_databases discovers the compartment's
+        homes first and lists databases against each discovered home id.
+        """
         db_client = MagicMock()
         rec_client = MagicMock()
         mock_get_db_client.return_value = db_client
@@ -356,6 +393,10 @@ class TestRecoveryDatabaseTools:
     async def test_list_backups_compartment_path(
         self, mock_get_db_client, mock_fetch_homes
     ):
+        """
+        Given a compartment, list_backups discovers the databases in it and returns the
+        backups of each one that has auto-backup enabled.
+        """
         db_client = MagicMock()
         mock_get_db_client.return_value = db_client
         mock_fetch_homes.return_value = ["home1"]
@@ -404,6 +445,10 @@ class TestRecoveryDatabaseTools:
     async def test_list_backups_compartment_skips_db_without_autobackup(
         self, mock_get_db_client, mock_fetch_homes
     ):
+        """
+        A database with auto-backup disabled is skipped entirely -- no backup listing
+        call is made for it.
+        """
         db_client = MagicMock()
         mock_get_db_client.return_value = db_client
         mock_fetch_homes.return_value = ["home1"]
@@ -445,6 +490,10 @@ class TestRecoveryDatabaseTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_work_request_client")
     async def test_list_restore_empty_when_no_restore_ops(self, mock_get_wr_client):
+        """
+        A compartment whose work requests are all non-restore operations yields an
+        empty list rather than the unfiltered set.
+        """
         mock_client = MagicMock()
         mock_get_wr_client.return_value = mock_client
 
@@ -473,6 +522,10 @@ class TestRecoveryDatabaseTools:
     async def test_summarize_backup_destination_with_last_backup_time(
         self, mock_get_db_client
     ):
+        """
+        With include_last_backup_time set, each item carries the timestamp of the most
+        recent backup alongside its destination type.
+        """
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 
@@ -522,6 +575,10 @@ class TestRecoveryDatabaseTools:
     async def test_list_db_homes_fetch_child_compartments_dedup(
         self, mock_get_db_client
     ):
+        """
+        Scanning a compartment subtree collapses a DB Home that appears in more than
+        one compartment to a single entry.
+        """
         mock_client = MagicMock()
         mock_get_db_client.return_value = mock_client
 

@@ -65,6 +65,19 @@ the server gains two new guidance tools.
 - OCI requests now carry an `opc-request-id` stamped with opaque installation, caller,
   and tool markers, so a customer-reported call can be traced in service logs without
   identifying the user.
+- **Every tool declares `readOnlyHint`.** The server never creates, updates, or deletes an
+  OCI resource, and now says so in each tool's MCP annotations instead of only in the
+  README, so a host can act on it. The three guidance tools additionally declare
+  `openWorldHint: false`, since they return static text and never reach the network.
+- **Summary scans report what they could not read.** `summarize_protected_database_redo_status`
+  returns an `unknown` count for databases whose redo status could not be determined —
+  most often because the caller cannot `GET` them. They were previously left out of every
+  bucket, so a permissions gap looked like a clean bill of health. Both compartment-subtree
+  summaries also stop at `ORACLE_MCP_TOOL_DEADLINE_SECONDS` (default 120) and set
+  `truncated: true` rather than running until the client gives up.
+- `ORACLE_MCP_STATE_DIR`, `ORACLE_MCP_TOOL_DEADLINE_SECONDS`, and
+  `ORACLE_MCP_CACHE_MAX_ENTRIES` settings; the previously undocumented compartment cap,
+  cache TTL, and log redaction variables are now in the README table as well.
 
 ### Changed
 
@@ -78,12 +91,70 @@ the server gains two new guidance tools.
   a client bug. Clients now register with DCR against `/register`, which never leaves the
   host. Startup fails loudly if a future FastMCP release renames the private attribute
   this relies on.
-- Updated dependency locks for FastMCP 3.4.5, OCI SDK 2.182.1, and Pydantic 2.13.4.
+- **Logs now live in `~/.oci-recovery-mcp/logs`, not in the install tree.** The default
+  log directory was resolved relative to the package, which put it inside the virtualenv:
+  read-only on a hardened deployment, and discarded with the environment on every `uvx`
+  run, so the logs an operator is told to read did not survive the session. Override with
+  `ORACLE_MCP_LOG_DIR` or `ORACLE_MCP_STATE_DIR`.
+- **Tool results are logged as a shape summary at `INFO`, in full only at `DEBUG`.** A
+  result is a tenancy's resource inventory; writing every one of them to disk was both a
+  lot of volume and a lot of customer data at rest. Log files are also created `0600` now,
+  on each rotation, so they are not readable by other users of the host.
+- Updated dependency locks for FastMCP 3.4.5, OCI SDK 2.185.1,
+  Cryptography 50.0.1, and Pydantic 2.13.4.
 - README now documents all supported environment variables and the hosted OAuth setup
   inline.
 
 ### Fixed
 
+- **`list_restore` failed whenever `status`, `sort_by`, or `sort_order` was passed.** All
+  three were advertised in the tool schema and forwarded straight into
+  `oci.work_requests.WorkRequestClient.list_work_requests`, which accepts only
+  `resource_id`, `limit`, `page`, and `opc_request_id` and raises `ValueError:
+  list_work_requests got unknown kwargs` on anything else — so using any of them was a
+  hard failure. They are now applied to the results instead, the same way the tool
+  already filters to restore operations, and an invalid `sort_by`/`sort_order` is
+  rejected with a message naming the accepted values.
+- **`list_protection_policies` failed whenever `id` was passed.** The same class of
+  defect: the SDK call names that filter `protection_policy_id` and rejects `id`. It is
+  now sent under the name the SDK expects. `list_protected_databases` and
+  `list_recovery_service_subnets` genuinely do accept `id`, and are unchanged.
+- **One inaccessible compartment wiped protection-policy links for every database.**
+  `list_databases` correlates each database to its protection policy by listing
+  protected databases across the compartments in scope, and the whole loop sat inside a
+  single `try` that reset the correlation map on any failure. A caller who cannot list
+  protected databases in one compartment of a subtree — an ordinary 404
+  `NotAuthorizedOrNotFound` in a large tenancy — therefore got `protectionPolicyId: null`
+  for every database in every *readable* compartment too, which reads as "not protected"
+  rather than "could not check". Each compartment is now scoped separately, partial
+  results are kept, and skipped compartments are logged.
+- **An unwritable log directory stopped the server from starting.** Logging is configured
+  at import, and neither the directory creation nor the file handler was guarded, so a
+  read-only filesystem, a directory owned by another user, or a full disk killed the
+  process with a `PermissionError` traceback before startup could report anything. File
+  logging is now best-effort: the server warns, names the path, and logs to stderr.
+- **`get_recovery_service_metrics` interpolated caller input into its Monitoring query.**
+  `metricName`, `resolution`, `aggregation`, and `protected_database_id` were concatenated
+  into the MQL expression with no validation, despite the parameter docs promising fixed
+  sets, and a quote in the database OCID could break out of the `resourceId` filter. All
+  four are now validated against those sets before the query is built, and an invalid one
+  is rejected with a message naming the accepted values.
+- **The two summary tools advertised an output schema they did not return.** Both declared
+  a counts model but returned a wrapper holding the aggregate, the per-compartment
+  breakdown, and the compartments scanned, so any client trusting `outputSchema` was given
+  the wrong contract. They now declare `ProtectedDatabaseHealthSummary` and
+  `ProtectedDatabaseRedoSummary`, which describe what is actually sent. Wire field names
+  are unchanged.
+- **In-process caches grew without bound.** The compartment and region caches expired
+  entries by TTL but never removed them, and both are partitioned per tenancy and per
+  caller — so a hosted deployment gained an entry, holding that caller's whole compartment
+  listing, for every person who ever signed in. Entries are now swept on write and capped
+  at `ORACLE_MCP_CACHE_MAX_ENTRIES` with least-recently-used eviction.
+- **HTTP deployments now refuse local profile credentials outright.** Credential selection
+  was per request, so a call that somehow ran outside an authenticated request context
+  would have been signed with the operator's own credentials instead of the caller's. When
+  an HTTP authentication policy has been built, that path now raises rather than acting
+  under the wrong identity.
 - **Sign-in failed with `invalid_scope` because resource scopes were sent to IDCS
   unqualified.** IDCS names a resource application's scopes by concatenating the
   application's primary audience with the scope name, and `/authorize` accepts only that

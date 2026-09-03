@@ -257,16 +257,21 @@ public root certificate. Distribute only the public root certificate, never the 
 | `OCI_CONFIG_FILE`, `OCI_CONFIG_PROFILE` | stdio | Optional. Standard `oracle-mcp-common` config-file and profile resolution. Default `~/.oci/config` and `DEFAULT`. |
 | `ORACLE_MCP_AUTH_METHOD`, `ORACLE_MCP_AUTH_PROFILE` | stdio | Optional, retained for 2.x compatibility. Equivalent to `OCI_MCP_AUTH_TYPE` and `OCI_CONFIG_PROFILE`; when both are set the `OCI_*` name wins. |
 | `ORACLE_MCP_ENV_FILE` | all | Path to a specific `.env` file instead of directory discovery. |
-| `ORACLE_MCP_HOST`, `ORACLE_MCP_PORT` | all | Setting both runs the Streamable HTTP listener instead of stdio. |
+| `ORACLE_MCP_HOST`, `ORACLE_MCP_PORT` | all | Setting both runs the Streamable HTTP listener instead of stdio. Startup fails if only one is set or if the port is outside `1..65535`. |
 | `ORACLE_MCP_BASE_URL` | HTTP | Required. Public URL clients reach, used to build the authorize, callback, and well-known URLs. |
 | `IDCS_DOMAIN`, `IDCS_CLIENT_ID`, `IDCS_CLIENT_SECRET`, `IDCS_AUDIENCE` | HTTP | Required. The IAM domain and its confidential OAuth application. Validated by `oracle-mcp-common` before the listener starts. |
 | `IDCS_REQUIRED_SCOPES` | HTTP | Required scopes, written bare, as a space-delimited list or JSON array. Defaults to `openid profile email oci_mcp.recovery.invoke`. |
-| `OCI_REGION` | HTTP | Default region for the request-token exchange. A tool's `region` argument overrides it per request. |
+| `OCI_REGION`, `ORACLE_MCP_REGION` | HTTP | Default region for the request-token exchange. A tool's `region` argument overrides it per request. |
 | `ORACLE_MCP_TENANCY_ID` | HTTP | Required. Tenancy OCID used for compartment and region discovery; `TENANCY_ID_OVERRIDE` is accepted as a synonym. |
 | `FASTMCP_HOME` | HTTP | FastMCP's home directory, where OAuth state is persisted. Contains secret material; must be exported, not set in `.env`. |
 | `TENANCY_ID_OVERRIDE` | stdio | Overrides the tenancy read from the OCI config profile. |
 | `ORACLE_MCP_INSTALLATION_ID`, `ORACLE_MCP_INSTALLATION_ID_FILE` | all | Stable installation identifier for telemetry. Set explicitly on shared deployments. |
-| `ORACLE_MCP_LOG_LEVEL`, `ORACLE_MCP_LOG_TO_STDOUT`, `ORACLE_MCP_LOG_DIR`, `ORACLE_MCP_LOG_FILE`, `ORACLE_SDK_LOG_LEVEL` | all | Logging configuration. |
+| `ORACLE_MCP_STATE_DIR` | all | Directory for this server's own state: the log directory and the installation ID. Defaults to `~/.oci-recovery-mcp`. Set it when the home directory is not writable. |
+| `ORACLE_MCP_LOG_LEVEL`, `ORACLE_MCP_LOG_TO_STDOUT`, `ORACLE_MCP_LOG_DIR`, `ORACLE_MCP_LOG_FILE`, `ORACLE_SDK_LOG_LEVEL` | all | Logging configuration. Log files are created `0600` and rotate at 10 MB, keeping five. If the log file cannot be opened, the server warns and logs to stderr rather than failing to start. |
+| `ORACLE_MCP_LOG_REDACT_KEYS`, `ORACLE_MCP_LOG_MAX_VALUE_CHARS` | all | Comma-separated keys redacted from logged payloads (defaults cover tokens, secrets, keys and passphrases), and the per-value truncation length (default 20000). Tool results are logged as a shape summary at `INFO` and in full only at `DEBUG`. |
+| `ORACLE_MCP_MAX_COMPARTMENTS_IN_SCOPE` | all | Cap on compartments scanned when `fetch_for_child_compartment=true`. Default 200. |
+| `ORACLE_MCP_TOOL_DEADLINE_SECONDS` | all | Monotonic-time budget for compartment-subtree summary scans, checked between OCI requests. Default 120; `0` disables the limit. An in-flight request is allowed to finish; a scan that stops early returns `truncated: true` with partial counts. |
+| `ORACLE_MCP_COMPARTMENT_CACHE_TTL_SECONDS`, `ORACLE_MCP_REGION_CACHE_TTL_SECONDS`, `ORACLE_MCP_CACHE_MAX_ENTRIES` | all | In-process cache lifetimes (default 300s and 3600s) and the maximum number of cache entries kept per cache (default 256). Caches are partitioned per tenancy and per caller. |
 
 ## Tools
 
@@ -287,7 +292,7 @@ Install the development dependencies before running tests:
 
 ```sh
 uv sync --group dev
-uv run pytest
+uv run pytest --cov=. --cov-branch --cov-report=term-missing
 ```
 
 The test suite is offline: OCI clients are mocked, so no credentials or live resources

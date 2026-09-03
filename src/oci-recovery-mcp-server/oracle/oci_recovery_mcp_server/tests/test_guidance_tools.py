@@ -16,8 +16,14 @@ from oracle.oci_recovery_mcp_server.server import (
 
 
 class TestGuidanceTools:
+    """
+    The three prompt-backed tools that serve guidance text to clients that cannot
+    read MCP prompts.
+    """
+
     @pytest.mark.asyncio
     async def test_dashboard_prompt_is_available_as_a_tool(self):
+        """The dashboard tool is registered, and returns the prompt text verbatim."""
         async with Client(mcp) as client:
             tools = await client.list_tools()
             result = await client.call_tool("oci_recovery_service_dashboard_prompt", {})
@@ -28,6 +34,7 @@ class TestGuidanceTools:
 
     @pytest.mark.asyncio
     async def test_cloud_protect_onboarding_guidance_is_available_as_a_tool(self):
+        """The onboarding tool is registered, and returns the prompt text verbatim."""
         async with Client(mcp) as client:
             tools = await client.list_tools()
             result = await client.call_tool("onboard_database_to_recovery_service", {})
@@ -38,6 +45,7 @@ class TestGuidanceTools:
 
     @pytest.mark.asyncio
     async def test_diagnostic_guidance_is_available_as_a_tool(self):
+        """The diagnostic tool is registered, and returns the prompt text verbatim."""
         async with Client(mcp) as client:
             tools = await client.list_tools()
             result = await client.call_tool("diagnose_recovery_service_issue", {})

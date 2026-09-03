@@ -16,9 +16,23 @@ from oracle.oci_recovery_mcp_server.server import mcp
 
 
 class TestGetClientFactories:
+    """
+    Request marking and client construction: the opc-request-id every OCI call
+    carries, the pseudonyms inside it, and the auth each client factory resolves.
+    """
+
     def test_oci_client_wrapper_adds_mcp_request_marker(self, monkeypatch):
+        """
+        Every wrapped SDK call carries an opc-request-id naming this installation, the
+        caller and the tool. A caller-supplied id is re-marked; one already carrying the
+        marker is left alone.
+        """
+
         class FakeClient:
+            """A client whose one operation echoes back the request id it was given."""
+
             def get_resource(self, **kwargs):
+                """Return the opc_request_id the wrapper injected."""
                 return kwargs["opc_request_id"]
 
         installation_id = "installation-id"
@@ -37,6 +51,10 @@ class TestGetClientFactories:
             server._MCP_ACTOR_ID_CONTEXT.reset(actor_id_token)
 
     def test_mcp_id_is_a_pseudonym_of_the_authenticated_subject(self, monkeypatch):
+        """
+        The actor id is derived from the token's subject: stable across calls, six
+        characters wide, and never the subject itself.
+        """
         access = SimpleNamespace(claims={"iss": "https://idcs-abc", "sub": "user@example.com"})
         monkeypatch.setattr(server, "get_access_token", lambda: access)
 
@@ -47,6 +65,7 @@ class TestGetClientFactories:
         assert actor_id == server._mcp_actor_id()
 
     def test_mcp_id_uses_token_jti_when_subject_is_unavailable(self, monkeypatch):
+        """A token with no subject falls back to its jti, still pseudonymized."""
         access = SimpleNamespace(claims={"iss": "https://idcs-abc", "jti": "session-token-id"})
         monkeypatch.setattr(server, "get_access_token", lambda: access)
 
@@ -56,6 +75,10 @@ class TestGetClientFactories:
         assert actor_id != "session-token-id"
 
     def test_mcp_id_uses_fastmcp_session_when_the_token_has_no_principal(self, monkeypatch):
+        """
+        A token naming neither subject nor jti falls back to the issuer and the FastMCP
+        session id, which is likewise not carried through in the clear.
+        """
         access = SimpleNamespace(claims={"iss": "https://idcs-abc"})
         monkeypatch.setattr(server, "get_access_token", lambda: access)
         monkeypatch.setattr(
@@ -70,6 +93,10 @@ class TestGetClientFactories:
         assert actor_id != "fastmcp-session-id"
 
     def test_mcp_actor_id_prefers_fastmcp_session_for_shared_local_credentials(self, monkeypatch):
+        """
+        Under a shared local credential the OCI user is the same for everyone, so the
+        FastMCP session is what distinguishes one caller from another.
+        """
         monkeypatch.setenv("ORACLE_MCP_AUTH_METHOD", "session")
         monkeypatch.setattr(
             "fastmcp.server.dependencies.get_context",
@@ -85,6 +112,11 @@ class TestGetClientFactories:
         assert server._mcp_actor_id() == server._marker_fragment("mcp-session:fastmcp-session-id", 6)
 
     def test_mcp_id_uses_server_instance_when_no_mcp_context_is_available(self, monkeypatch):
+        """
+        With no token, no MCP context and no readable OCI config, the actor id falls
+        back to this process's own instance id -- which is not persisted, so it cannot
+        identify a person across restarts.
+        """
         monkeypatch.setattr(server, "get_access_token", lambda: None)
         monkeypatch.setattr(
             "fastmcp.server.dependencies.get_context",
@@ -101,6 +133,10 @@ class TestGetClientFactories:
         assert server._mcp_actor_id() == server._marker_fragment("mcp-server:server-instance-id", 6)
 
     def test_mcp_installation_id_is_persisted_locally(self, monkeypatch, tmp_path):
+        """
+        The installation id is generated once, written to the state file, and reused on
+        every later call.
+        """
         id_file = tmp_path / "state" / "installation-id"
         monkeypatch.delenv("ORACLE_MCP_INSTALLATION_ID", raising=False)
         monkeypatch.setenv("ORACLE_MCP_INSTALLATION_ID_FILE", str(id_file))
@@ -112,20 +148,32 @@ class TestGetClientFactories:
         assert installation_id == server._mcp_installation_id()
 
     def test_mcp_installation_id_uses_server_configuration(self, monkeypatch):
+        """
+        A configured installation id is used as given, pseudonymized to eight
+        characters.
+        """
         monkeypatch.setenv("ORACLE_MCP_INSTALLATION_ID", "hosted-deployment-a")
 
         assert server._mcp_installation_id() == server._marker_fragment("hosted-deployment-a", 8)
 
     def test_tool_logger_propagates_mcp_and_tool_ids_to_oci_calls(self, monkeypatch):
+        """
+        The tool decorator puts the actor and tool ids in scope for the OCI calls the
+        tool makes, and clears both once it returns.
+        """
         monkeypatch.setattr(server, "_mcp_actor_id", lambda: "abcdef")
         monkeypatch.setenv("ORACLE_MCP_INSTALLATION_ID", "installation-id")
 
         class FakeClient:
+            """A client whose one operation echoes back the request id it was given."""
+
             def get_resource(self, **kwargs):
+                """Return the opc_request_id the wrapper injected."""
                 return kwargs["opc_request_id"]
 
         @server._tool_logger("list_protected_databases")
         def fake_tool():
+            """Make one wrapped OCI call and return the request id it carried."""
             client = server._wrap_oci_client(FakeClient(), request_id="generated-id", client_name="recovery")
             return client.get_resource()
 
@@ -136,8 +184,16 @@ class TestGetClientFactories:
         assert server._MCP_TOOL_ID_CONTEXT.get() == "unknown"
 
     def test_oci_client_wrapper_skips_operations_without_opc_request_id(self):
+        """
+        An SDK operation that does not accept the kwarg is called without it, rather
+        than failing on an argument it does not know.
+        """
+
         class FakeClient:
+            """A client whose operation echoes back the kwargs it received."""
+
             def list_compartments(self, **kwargs):
+                """Return the kwargs, so the test can see what the wrapper passed."""
                 return kwargs
 
         client = server._wrap_oci_client(FakeClient(), request_id="generated-id", client_name="identity")
@@ -146,19 +202,32 @@ class TestGetClientFactories:
         assert not server._operation_supports_opc_request_id(oci.identity.IdentityClient.list_compartments)
 
     def test_oci_client_wrapper_marks_operations_without_opc_request_id_kwarg(self, monkeypatch):
+        """
+        An operation that takes no opc_request_id kwarg is still marked, by way of the
+        header the generated SDK code sends.
+        """
+
         class FakeBaseClient:
+            """A base client that records the call_api kwargs the operation passed down."""
+
             def __init__(self):
+                """Start with no recorded call."""
                 self.call_kwargs = None
 
             def call_api(self, *args, **kwargs):
+                """Record the kwargs and return a canned response."""
                 self.call_kwargs = kwargs
                 return "response"
 
         class FakeClient:
+            """A generated-style client that reaches the service through its base client."""
+
             def __init__(self):
+                """Attach the recording base client."""
                 self.base_client = FakeBaseClient()
 
             def list_compartments(self, **kwargs):
+                """Call through the base client the way generated SDK operations do."""
                 return self.base_client.call_api(header_params={"accept": "application/json"})
 
         monkeypatch.setenv("ORACLE_MCP_INSTALLATION_ID", "installation-id")
@@ -176,6 +245,10 @@ class TestGetClientFactories:
             server._MCP_ACTOR_ID_CONTEXT.reset(actor_id_token)
 
     def test_mcp_opc_request_id_fits_oci_preserved_prefix(self, monkeypatch):
+        """
+        The assembled marker is exactly 32 characters -- the prefix OCI preserves -- so
+        no part of it is truncated in the service's own logs.
+        """
         monkeypatch.setenv("ORACLE_MCP_INSTALLATION_ID", "installation-id")
         actor_id_token = server._MCP_ACTOR_ID_CONTEXT.set("abcdef")
         tool_id_token = server._MCP_TOOL_ID_CONTEXT.set("list_backups")
@@ -197,6 +270,10 @@ class TestGetClientFactories:
         mock_client,
         _mock_wrap,
     ):
+        """
+        The recovery client takes its config and signer from the shared auth context,
+        with the caller's region and the derived user agent applied.
+        """
         signer = object()
         mock_build_auth_context.return_value = SimpleNamespace(
             config={"region": "us-ashburn-1"}, signer=signer
@@ -220,6 +297,7 @@ class TestGetClientFactories:
         mock_client,
         _mock_wrap,
     ):
+        """The monitoring client follows the same path as the recovery client."""
         signer = object()
         mock_build_auth_context.return_value = SimpleNamespace(
             config={"region": "us-ashburn-1"}, signer=signer
@@ -237,15 +315,20 @@ class TestGetClientFactories:
     def test_legacy_auth_method_spellings_all_keep_working(
         self, mock_from_file, monkeypatch
     ):
-        # oracle-mcp-common reads ORACLE_MCP_AUTH_METHOD itself and understands
-        # "session", "api_key", and "api-key". It does NOT understand the
-        # unseparated "apikey" this server documented in 2.x -- an unrecognized
-        # value is a hard error there -- so only that one is translated here.
+        """
+        Every ORACLE_MCP_AUTH_METHOD spelling this server has documented still works.
+
+        oracle-mcp-common reads the variable itself and understands "session",
+        "api_key" and "api-key". It does NOT understand the unseparated "apikey" this
+        server documented in 2.x -- an unrecognized value is a hard error there -- so
+        only that one is translated here.
+        """
         from oracle_mcp_common import AuthType
 
         captured = {}
 
         def fake_build_auth_context(*args):
+            """Record what the server forces, if anything."""
             captured["args"] = args
             return SimpleNamespace(config={}, signer=object())
 
@@ -266,10 +349,13 @@ class TestGetClientFactories:
             assert captured["args"] == ()
 
     def test_profile_name_resolution_follows_the_shared_library(self, monkeypatch):
-        # The informational config lookups must read the same profile the signer
-        # used. The library resolves OCI_CONFIG_PROFILE before ORACLE_MCP_AUTH_PROFILE;
-        # resolving them in the opposite order here would read a different profile
-        # than the credentials whenever both are set.
+        """
+        The informational config read resolves the same profile the signer used.
+
+        The library resolves OCI_CONFIG_PROFILE before ORACLE_MCP_AUTH_PROFILE;
+        resolving them in the opposite order here would read a different profile than
+        the credentials whenever both are set.
+        """
         from oracle_mcp_common import resolve_profile_name
 
         monkeypatch.setenv("OCI_CONFIG_PROFILE", "FROM_OCI")
@@ -277,6 +363,7 @@ class TestGetClientFactories:
         seen = {}
 
         def fake_from_file(file_location, profile_name):
+            """Record which profile the config read asked for."""
             seen["profile"] = profile_name
             return {"region": "us-ashburn-1"}
 
@@ -290,21 +377,34 @@ def _fake_oci_provider(captured):
     """Stand in for FastMCP's OCIProvider, mirroring the hooks the server overrides."""
 
     class FakeOCIProvider:
+        """A stand-in for FastMCP's OCIProvider, recording what the server hands it."""
+
         # _cimd_manager mirrors the real provider: the server clears it so client
         # registration never depends on an outbound metadata fetch.
         _cimd_manager = object()
 
         def __init__(self, **kwargs):
-            # required_scopes is the upstream authorize fallback and is rewritten
-            # with the qualified scopes; the verifier's own copy stays bare.
-            self.required_scopes: list[str] = []
+            """Seed required_scopes from the verifier's copy, as the real provider does."""
+            # The real provider seeds required_scopes from the verifier's copy, and
+            # FastMCP hands this same list to RequireAuthMiddleware, so it has to
+            # stay bare.
+            self.required_scopes: list[str] = list(kwargs.get("required_scopes") or [])
             captured.update(kwargs)
             captured["provider"] = self
 
         def update_default_scopes(self, scopes):
+            """Record the scopes advertised to clients."""
             captured["default_scopes"] = list(scopes)
 
+        def _build_upstream_authorize_url(self, txn_id, transaction):
+            """Record the scopes the /authorize request would carry."""
+            # Stands in for the real URL builder: only the scopes it was handed
+            # matter here.
+            captured["authorize_scopes"] = list(transaction.get("scopes") or [])
+            return f"https://idcs.example.com/authorize?state={txn_id}"
+
         def _prepare_scopes_for_upstream_refresh(self, scopes):
+            """Return the scopes unchanged, letting the server's override qualify them."""
             return scopes
 
     return FakeOCIProvider
@@ -315,11 +415,13 @@ class TestHttpTransportAuth:
 
     @pytest.fixture(autouse=True)
     def _reset_http_auth(self):
+        """Clear the module-level HTTP auth policy around each test."""
         server._http_auth = None
         yield
         server._http_auth = None
 
     def _idcs_env(self, monkeypatch):
+        """Set the IDCS environment a hosted deployment is configured with."""
         for name, value in {
             "IDCS_DOMAIN": "idcs-abc.identity.oraclecloud.com",
             "IDCS_CLIENT_ID": "cid",
@@ -334,14 +436,19 @@ class TestHttpTransportAuth:
     def test_unset_auth_method_leaves_auto_detection_to_the_shared_library(
         self, monkeypatch
     ):
-        # Forcing an auth type when ORACLE_MCP_AUTH_METHOD is unset would defeat
-        # oracle-mcp-common's "auto" mode, which picks security-token only when the
-        # profile directly declares a security_token_file. An API-key-only profile
-        # would then be rejected for not declaring one.
+        """
+        With ORACLE_MCP_AUTH_METHOD unset, nothing is forced and the library auto-detects.
+
+        Forcing an auth type here would defeat oracle-mcp-common's "auto" mode, which
+        picks security-token only when the profile directly declares a
+        security_token_file. An API-key-only profile would then be rejected for not
+        declaring one.
+        """
         monkeypatch.delenv("ORACLE_MCP_AUTH_METHOD", raising=False)
         captured = {}
 
         def fake_build_auth_context(*args):
+            """Record what the server forces, if anything."""
             captured["args"] = args
             return SimpleNamespace(config={}, signer=object())
 
@@ -353,7 +460,50 @@ class TestHttpTransportAuth:
         assert captured["args"] == ()  # nothing forced; the library decides
         assert server._resolved_auth_type_label() == "auto"
 
+    def test_canonical_auth_type_outranks_the_deprecated_spelling(self, monkeypatch):
+        """
+        A canonical auth-type variable wins over the deprecated "apikey" spelling.
+
+        The translated value is passed as an explicit AuthOptions, which outranks every
+        environment variable inside resolve_auth_type(). Applying it while
+        OCI_MCP_AUTH_TYPE is set would let the deprecated name win -- and
+        security_token + apikey would then sign requests with the profile's API key,
+        which OCI rejects with 401 after an apparently successful startup.
+        """
+        captured = {}
+
+        def fake_build_auth_context(*args):
+            """Record what the server forces, if anything."""
+            captured["args"] = args
+            return SimpleNamespace(config={}, signer=object())
+
+        monkeypatch.setattr(
+            "oracle.oci_recovery_mcp_server.server.build_auth_context",
+            fake_build_auth_context,
+        )
+        monkeypatch.setenv("ORACLE_MCP_AUTH_METHOD", "apikey")
+
+        for canonical in server._CANONICAL_AUTH_TYPE_ENV:
+            for name in server._CANONICAL_AUTH_TYPE_ENV:
+                monkeypatch.delenv(name, raising=False)
+            monkeypatch.setenv(canonical, "security_token")
+
+            assert server._deprecated_auth_method_override() is None
+            server._build_profile_auth_context()
+            assert captured["args"] == ()  # the library resolves security_token
+            assert server._resolved_auth_type_label() == "security_token"
+
+        # With no canonical variable set, the deprecated spelling still works.
+        for name in server._CANONICAL_AUTH_TYPE_ENV:
+            monkeypatch.delenv(name, raising=False)
+        server._build_profile_auth_context()
+        assert captured["args"][0].auth_type is server.AuthType.API_KEY
+
     def test_default_scopes_gate_on_the_recovery_invoke_scope(self, monkeypatch):
+        """
+        With no override configured, the required scopes include the Recovery Service
+        invoke scope alongside the OIDC defaults.
+        """
         monkeypatch.delenv("IDCS_REQUIRED_SCOPES", raising=False)
         assert server._required_scopes() == [
             "openid",
@@ -363,10 +513,15 @@ class TestHttpTransportAuth:
         ]
 
     def test_required_scopes_can_be_overridden(self, monkeypatch):
+        """IDCS_REQUIRED_SCOPES replaces the default list entirely."""
         monkeypatch.setenv("IDCS_REQUIRED_SCOPES", "openid offline_access")
         assert server._required_scopes() == ["openid", "offline_access"]
 
     def test_serving_http_is_false_outside_a_request(self, monkeypatch):
+        """
+        With neither an access token nor an HTTP request in scope, the server is not
+        serving HTTP.
+        """
         monkeypatch.setattr(server, "get_access_token", lambda: None)
         monkeypatch.setattr(
             server,
@@ -376,14 +531,19 @@ class TestHttpTransportAuth:
         assert server._serving_http() is False
 
     def test_serving_http_is_true_for_an_authenticated_caller(self, monkeypatch):
+        """An access token in scope means the server is serving HTTP."""
         monkeypatch.setattr(
             server, "get_access_token", lambda: SimpleNamespace(token="tok", claims={})
         )
         assert server._serving_http() is True
 
     def test_get_tenancy_over_http_requires_an_explicit_tenancy(self, monkeypatch):
-        # A hosted deployment has no OCI config file, so falling back to one would
-        # silently serve whatever tenancy happens to be configured on the host.
+        """
+        Over HTTP the tenancy must be configured; there is no fallback.
+
+        A hosted deployment has no OCI config file, so falling back to one would
+        silently serve whatever tenancy happens to be configured on the host.
+        """
         monkeypatch.setattr(server, "_serving_http", lambda: True)
         monkeypatch.delenv("ORACLE_MCP_TENANCY_ID", raising=False)
         monkeypatch.delenv("TENANCY_ID_OVERRIDE", raising=False)
@@ -401,6 +561,10 @@ class TestHttpTransportAuth:
     def test_make_client_over_http_uses_the_shared_idcs_request_context(
         self, mock_client, _mock_wrap, monkeypatch
     ):
+        """
+        Over HTTP the client is built from the shared library's per-request context
+        rather than from any local profile.
+        """
         signer = object()
         monkeypatch.setattr(server, "_serving_http", lambda: True)
         monkeypatch.setattr(
@@ -417,10 +581,13 @@ class TestHttpTransportAuth:
         assert result is mock_client.return_value
 
     def test_http_token_exchange_carries_the_derived_user_agent(self, monkeypatch):
-        # BEST_PRACTICES requires the exact derived additional_user_agent on every
-        # client-construction path, HTTP/token-exchange included. context_for()
-        # returns only {"region": ...}, so the server must add it here or the
-        # hosted deployment's OCI calls go out untagged.
+        """
+        The token-exchange config carries the derived additional_user_agent.
+
+        BEST_PRACTICES requires it on every client-construction path, HTTP included.
+        context_for() returns only {"region": ...}, so the server must add it here or
+        the hosted deployment's OCI calls go out untagged.
+        """
         from oracle_mcp_common import IDCSHttpAuth
 
         server._http_auth = IDCSHttpAuth(
@@ -441,8 +608,10 @@ class TestHttpTransportAuth:
         assert config["region"] == "us-phoenix-1"
 
     def test_http_client_construction_carries_the_derived_user_agent(self, monkeypatch):
-        # End to end through _make_client, so a regression in either the policy
-        # or the client factory is caught.
+        """
+        The same check end to end through _make_client, so a regression in either the
+        policy or the client factory is caught.
+        """
         from oracle_mcp_common import IDCSHttpAuth
 
         server._http_auth = IDCSHttpAuth(
@@ -466,16 +635,23 @@ class TestHttpTransportAuth:
         assert args[0]["additional_user_agent"] == f"oci-recovery-mcp/{server.__version__}"
 
     def test_request_signer_is_never_reused_across_calls(self, monkeypatch):
-        # No process-wide signer cache: every call asks oracle-mcp-common's
-        # context_for() for a signer scoped to the request that established the
-        # caller's identity, even for the same token jti. Only the policy
-        # (provider + server-side credentials) is long-lived, built once in main().
+        """
+        Every HTTP call gets its own signer -- there is no process-wide cache.
+
+        Each call asks oracle-mcp-common's context_for() for a signer scoped to the
+        request that established the caller's identity, even for the same token jti.
+        Only the policy (provider plus server-side credentials) is long-lived, built
+        once in main().
+        """
         from oracle_mcp_common import IDCSHttpAuth
 
         made = []
 
         class FakeTES:
+            """A token-exchange signer that records each construction."""
+
             def __init__(self, *args, **kwargs):
+                """Record the arguments this signer was built from."""
                 made.append((args, kwargs))
 
         server._http_auth = IDCSHttpAuth(
@@ -499,13 +675,22 @@ class TestHttpTransportAuth:
         assert made[0][0] == ("tok", "https://idcs-abc.identity.oraclecloud.com", "cid", "csec")
 
     def test_http_signer_requires_an_initialized_policy(self, monkeypatch):
+        """
+        Asking for a signer before the HTTP auth policy is built is an error, not a
+        silent fallback.
+        """
         server._http_auth = None
         with pytest.raises(RuntimeError, match="has not been initialized"):
             server._http_config_and_signer()
 
     def test_http_signer_requires_an_authenticated_caller(self, monkeypatch):
+        """An unauthenticated HTTP caller cannot obtain a signer."""
+
         class RejectingAuth:
+            """An auth policy that refuses every unauthenticated caller."""
+
             def context_for(self, token, *, region=None):
+                """Refuse, the way the real policy does for a missing token."""
                 raise ValueError("HTTP requests require an authenticated IDCS access token.")
 
         server._http_auth = RejectingAuth()
@@ -515,15 +700,22 @@ class TestHttpTransportAuth:
             server._http_config_and_signer()
 
     def test_http_signer_surfaces_the_iam_error_body(self, monkeypatch):
-        # context_for() wraps SDK failures, so the IAM response body hangs off the
-        # wrapped cause; it must still reach the operator-facing message.
+        """
+        The IAM response body reaches the operator-facing message.
+
+        context_for() wraps SDK failures, so the body hangs off the wrapped cause; it
+        must still be surfaced.
+        """
         cause = RuntimeError("boom")
         cause.response = SimpleNamespace(status_code=401, text="invalid_grant")
         wrapped = ValueError("Unable to construct the HTTP IDCS token-exchange signer")
         wrapped.__cause__ = cause
 
         class FailingAuth:
+            """An auth policy that fails with an IAM rejection wrapped in a cause."""
+
             def context_for(self, _token, *, region=None):
+                """Raise the pre-built wrapped failure."""
                 raise wrapped
 
         server._http_auth = FailingAuth()
@@ -534,9 +726,14 @@ class TestHttpTransportAuth:
             server._http_config_and_signer()
 
     def test_http_signer_error_never_leaks_the_client_secret(self, monkeypatch):
-        # The IAM diagnostic body is surfaced to the operator, so the failure path
-        # must not also carry the confidential application's credentials or the
-        # caller's own token into the message or the log record.
+        """
+        Neither the raised message, the log record, nor the policy's repr carries the
+        client secret or the caller's token.
+
+        The IAM diagnostic body is surfaced to the operator, so the failure path must
+        not also carry the confidential application's credentials or the caller's own
+        token along with it.
+        """
         from oracle_mcp_common import IDCSHttpAuth
 
         secret = "super-secret-client-value"
@@ -558,6 +755,7 @@ class TestHttpTransportAuth:
         )
 
         def _boom(*_a, **_k):
+            """Fail the way a real IAM rejection does, with the response on the cause."""
             # context_for() wraps this once, so the response hangs off __cause__,
             # exactly as it does for a real IAM rejection.
             error = RuntimeError("boom")
@@ -577,6 +775,12 @@ class TestHttpTransportAuth:
         assert secret not in repr(auth)
 
     def test_build_http_auth_configures_the_shared_library_provider(self, monkeypatch):
+        """
+        The shared builder constructs the provider with this deployment's IDCS
+        settings, and the verifier's scope copy stays bare -- IDCS returns the scope
+        unqualified in the access token, which is what each request is validated
+        against.
+        """
         self._idcs_env(monkeypatch)
         monkeypatch.setenv("IDCS_REQUIRED_SCOPES", "openid offline_access")
         captured = {}
@@ -599,6 +803,10 @@ class TestHttpTransportAuth:
         assert list(captured["required_scopes"]) == ["openid", "offline_access"]
 
     def test_build_http_auth_requires_the_idcs_settings(self, monkeypatch):
+        """
+        Missing IDCS configuration fails the build rather than starting an
+        unauthenticated listener.
+        """
         for name in (
             "IDCS_DOMAIN",
             "IDCS_CLIENT_ID",
@@ -612,9 +820,13 @@ class TestHttpTransportAuth:
             server._build_http_auth()
 
     def test_resource_scopes_are_qualified_with_the_audience_upstream(self, monkeypatch):
-        # IDCS names a resource scope as audience+scope with no separator and
-        # rejects the bare form at /authorize with invalid_scope. Every surface
-        # that reaches IDCS must carry the qualified form; the verifier must not.
+        """
+        Every surface that reaches IDCS carries the qualified scope; everything
+        compared against an issued token stays bare.
+
+        IDCS names a resource scope as audience+scope with no separator and rejects the
+        bare form at /authorize with invalid_scope.
+        """
         self._idcs_env(monkeypatch)
         monkeypatch.setenv(
             "IDCS_REQUIRED_SCOPES", "openid offline_access oci_mcp.recovery.invoke"
@@ -625,11 +837,16 @@ class TestHttpTransportAuth:
             auth = server._build_http_auth()
 
         provider = auth.provider
+        bare = ["openid", "offline_access", "oci_mcp.recovery.invoke"]
         qualified = "https://recovery.example.comoci_mcp.recovery.invoke"
         # advertised to clients (DCR defaults, valid_scopes, metadata)
         assert captured["default_scopes"] == ["openid", "offline_access", qualified]
-        # the fallback used when a client sends no scope parameter at all
-        assert provider.required_scopes == ["openid", "offline_access", qualified]
+        # the /authorize request itself, built from what the client asked for
+        provider._build_upstream_authorize_url("txn", {"scopes": list(bare)})
+        assert captured["authorize_scopes"] == ["openid", "offline_access", qualified]
+        # and from required_scopes when the client sends no scope parameter at all
+        provider._build_upstream_authorize_url("txn", {})
+        assert captured["authorize_scopes"] == ["openid", "offline_access", qualified]
         # and the refresh request, which is built from the bare scopes IDCS stored
         assert provider._prepare_scopes_for_upstream_refresh(
             ["openid", "oci_mcp.recovery.invoke"]
@@ -640,22 +857,46 @@ class TestHttpTransportAuth:
             "offline_access",
             qualified,
         ]
-        # reserved IDCS scopes are never namespaced
-        assert captured["required_scopes"] == [
-            "openid",
-            "offline_access",
-            "oci_mcp.recovery.invoke",
-        ]
+        # the verifier's copy stays bare: IDCS returns the scope unqualified in the
+        # access token, and that is what every request is re-validated against
+        assert captured["required_scopes"] == bare
+
+    def test_request_time_scope_checks_are_left_bare(self, monkeypatch):
+        """
+        The provider's required_scopes stay bare.
+
+        FastMCP builds its transport routes from that list (fastmcp/server/http.py) and
+        hands it to RequireAuthMiddleware, which compares it to the bare scope claim of
+        the IDCS access token. Qualifying it would return insufficient_scope on every
+        request of a session that signed in successfully.
+        """
+        self._idcs_env(monkeypatch)
+        monkeypatch.setenv(
+            "IDCS_REQUIRED_SCOPES", "openid offline_access oci_mcp.recovery.invoke"
+        )
+        captured = {}
+
+        with patch("oracle_mcp_common.auth.OCIProvider", _fake_oci_provider(captured)):
+            auth = server._build_http_auth()
+
+        assert auth.provider.required_scopes == list(captured["required_scopes"])
 
     def test_startup_fails_if_fastmcp_drops_a_scope_hook(self, monkeypatch):
-        # Silently skipping the qualification would fail every sign-in with
-        # invalid_scope, far from the upgrade that caused it.
+        """
+        A provider missing the scope hooks fails startup loudly.
+
+        Silently skipping the qualification would fail every sign-in with
+        invalid_scope, far from the upgrade that caused it.
+        """
         self._idcs_env(monkeypatch)
 
         class ProviderWithoutScopeHooks:
+            """A provider that has lost the hooks the server overrides."""
+
             _cimd_manager = object()
 
             def __init__(self, **kwargs):
+                """Accept any configuration and keep none of it."""
                 pass
 
         with patch("oracle_mcp_common.auth.OCIProvider", ProviderWithoutScopeHooks):
@@ -663,8 +904,12 @@ class TestHttpTransportAuth:
                 server._build_http_auth()
 
     def test_cimd_client_registration_is_disabled(self, monkeypatch):
-        # CIMD makes client registration depend on this host fetching the client's
-        # metadata URL, which a VPN-only deployment cannot do. DCR is used instead.
+        """
+        Client registration never depends on an outbound metadata fetch.
+
+        CIMD would make registration depend on this host reaching the client's metadata
+        URL, which a VPN-only deployment cannot do. DCR is used instead.
+        """
         self._idcs_env(monkeypatch)
         captured = {}
 
@@ -674,16 +919,29 @@ class TestHttpTransportAuth:
         assert auth.provider._cimd_manager is None
 
     def test_startup_fails_if_cimd_cannot_be_disabled(self, monkeypatch):
+        """
+        A provider whose CIMD manager cannot be cleared fails startup rather than
+        serving with client registration silently depending on an outbound fetch.
+        """
         self._idcs_env(monkeypatch)
 
         class ProviderWithoutCimd:
+            """A provider carrying the scope hooks but no clearable CIMD manager."""
+
             def __init__(self, **kwargs):
+                """Start with an empty scope list."""
                 self.required_scopes = []
 
             def update_default_scopes(self, scopes):
+                """Accept the advertised scopes and discard them."""
                 pass
 
+            def _build_upstream_authorize_url(self, txn_id, transaction):
+                """Return an empty URL; only the hook's presence matters here."""
+                return ""
+
             def _prepare_scopes_for_upstream_refresh(self, scopes):
+                """Return the scopes unchanged."""
                 return scopes
 
         with patch("oracle_mcp_common.auth.OCIProvider", ProviderWithoutCimd):
@@ -695,11 +953,18 @@ class TestCachePartitioning:
     """In-process caches must never serve one tenancy's or one caller's data to another."""
 
     def test_region_cache_partitioned_by_tenant(self, monkeypatch):
+        """
+        One tenancy's subscribed regions are never served to another, and each tenancy
+        still gets its own cache hit.
+        """
         server._REGION_CACHE["items"].clear()
         calls = []
 
         def fake_identity(*, request_id=None):
+            """Serve a different region per tenancy, recording who asked."""
+
             def list_region_subscriptions(tenancy_id):
+                """Return this tenancy's one subscribed region."""
                 calls.append(tenancy_id)
                 name = "us-ashburn-1" if tenancy_id == "tA" else "us-phoenix-1"
                 return SimpleNamespace(
@@ -723,11 +988,13 @@ class TestCachePartitioning:
         assert calls == ["tA", "tB"]  # tA's 2nd lookup served from its own cache
 
     def test_compartment_cache_partitioned_by_tenant(self, monkeypatch):
+        """One tenancy's compartment listing is never served to another."""
         server._COMPARTMENT_CACHE["entries"].clear()
         seq = {"tA": [SimpleNamespace(id="cA")], "tB": [SimpleNamespace(id="cB")]}
         calls = []
 
         def fake_list(only_one_page, limit=100):
+            """Serve the current tenancy's compartments, recording who asked."""
             t = server.get_tenancy()
             calls.append(t)
             return list(seq[t])
@@ -757,16 +1024,20 @@ class TestCachePartitioning:
         assert calls == ["tA", "tB"]  # tA's 2nd call served from its own cache
 
     def test_compartment_cache_partitioned_by_caller_within_a_tenant(self, monkeypatch):
-        # The listing is fetched with access_level="ACCESSIBLE", so it reflects the
-        # calling identity's permissions. Two users of the SAME tenancy must never
-        # share an entry, or a broadly-permissioned user's compartment tree would be
-        # served to a restricted one.
+        """
+        Two callers in the same tenancy never share a compartment cache entry.
+
+        The listing is fetched with access_level="ACCESSIBLE", so it reflects the
+        calling identity's permissions: sharing an entry would serve a
+        broadly-permissioned user's compartment tree to a restricted one.
+        """
         server._COMPARTMENT_CACHE["entries"].clear()
         current = {"sub": "alice"}
         visible = {"alice": [SimpleNamespace(id="c-all")], "bob": [SimpleNamespace(id="c-few")]}
         calls = []
 
         def fake_list(only_one_page, limit=100):
+            """Serve the current caller's visible compartments, recording who asked."""
             calls.append(current["sub"])
             return list(visible[current["sub"]])
 
@@ -801,8 +1072,10 @@ class TestCachePartitioning:
         assert calls == ["alice", "bob"]  # alice's 2nd call served from her own entry
 
     def test_compartment_cache_partitioned_when_tokens_omit_sub(self, monkeypatch):
-        # Providers may omit sub. Two humans then arrive with empty claims and the
-        # SAME registered client_id; only the per-session token tells them apart.
+        """
+        Two callers whose tokens carry no subject and share a registered client_id are
+        still kept apart, by their per-session tokens.
+        """
         server._COMPARTMENT_CACHE["entries"].clear()
         current = {"token": "token-alice"}
         visible = {
@@ -812,6 +1085,7 @@ class TestCachePartitioning:
         calls = []
 
         def fake_list(only_one_page, limit=100):
+            """Serve the current token's visible compartments, recording who asked."""
             calls.append(current["token"])
             return list(visible[current["token"]])
 
@@ -846,16 +1120,20 @@ class TestCachePartitioning:
         assert calls == ["token-alice", "token-bob"]  # bob got no cache hit
 
     def test_caller_cache_key_never_shares_an_entry_without_an_identity(self, monkeypatch):
-        # No usable caller identity in oauth mode must isolate, not fall back to a
-        # shared key: the fallback is the failure mode this partitioning prevents.
+        """
+        With no usable caller identity in oauth mode the key isolates rather than
+        falling back to a shared one -- that fallback is the failure this partitioning
+        exists to prevent.
+        """
         monkeypatch.setattr(server, "_serving_http", lambda: True)
         monkeypatch.setattr(server, "get_access_token", lambda: None)
         assert server._caller_cache_key() != server._caller_cache_key()
 
     def test_caller_cache_key_isolates_tokens_sharing_one_oauth_client_id(self, monkeypatch):
-        # A client_id names the registered application, not the human: several
-        # users of the same MCP client share it. If it ever reached the key, one
-        # user's ACCESSIBLE compartment listing would be served to another.
+        """
+        A client_id names the registered application, not the human, so several users
+        of one MCP client share it. It never reaches the key.
+        """
         monkeypatch.setattr(server, "_serving_http", lambda: True)
         current = {"token": "token-alice"}
         monkeypatch.setattr(
@@ -872,8 +1150,10 @@ class TestCachePartitioning:
         assert "shared-client" not in alice + bob
 
     def test_caller_cache_key_uses_jti_when_the_token_omits_sub(self, monkeypatch):
-        # Same registered client, distinct sessions: jti keeps them apart and,
-        # unlike the raw token, is stable for the life of that token.
+        """
+        For distinct sessions of one registered client, jti separates the callers and,
+        unlike the raw token, stays stable for that token's life.
+        """
         monkeypatch.setattr(server, "_serving_http", lambda: True)
         current = {"jti": "jti-alice"}
         monkeypatch.setattr(
@@ -889,15 +1169,28 @@ class TestCachePartitioning:
         assert server._caller_cache_key() != alice
 
     def test_caller_cache_key_is_inert_for_profile_auth(self, monkeypatch):
-        # One process, one operator credential over stdio: nothing to separate.
+        """
+        Under stdio there is one process and one operator credential, so there is
+        nothing to partition.
+        """
         monkeypatch.setattr(server, "_serving_http", lambda: False)
         assert server._caller_cache_key() == ""
 
 
 class TestRecoveryTools:
+    """
+    The Recovery Service tools driven end to end through a FastMCP client, so each
+    assertion covers the JSON a real client receives rather than the tool's return
+    value alone.
+    """
+
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_list_protected_databases(self, mock_get_client):
+        """
+        Listing protected databases returns the mapped summaries, with metrics read
+        from the summary itself when the per-database GET adds nothing.
+        """
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -930,6 +1223,10 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_get_protected_database(self, mock_get_client):
+        """
+        get_protected_database returns the mapped protected database, including its
+        health and nested metrics.
+        """
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -958,6 +1255,7 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_list_protection_policies(self, mock_get_client):
+        """Listing protection policies returns the mapped policy summaries."""
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -987,6 +1285,7 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_get_protection_policy(self, mock_get_client):
+        """get_protection_policy returns the mapped policy."""
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -1010,6 +1309,7 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_list_recovery_service_subnets(self, mock_get_client):
+        """Listing Recovery Service subnets returns the mapped subnet summaries."""
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -1039,6 +1339,7 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_get_recovery_service_subnet(self, mock_get_client):
+        """get_recovery_service_subnet returns the mapped subnet."""
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -1065,6 +1366,10 @@ class TestRecoveryTools:
     async def test_summarize_protected_database_health(
         self, mock_get_client, mock_get_tenancy
     ):
+        """
+        The health summary reads each protected database's health from its own GET and
+        counts them into the aggregated buckets.
+        """
         mock_get_tenancy.return_value = "ocid1.compartment.oc1..test"
 
         mock_client = MagicMock()
@@ -1113,6 +1418,10 @@ class TestRecoveryTools:
     async def test_summarize_protected_database_redo_status(
         self, mock_get_client, mock_get_tenancy
     ):
+        """
+        The redo summary counts each protected database as enabled or disabled from its
+        redo-shipped flag.
+        """
         mock_get_tenancy.return_value = "ocid1.compartment.oc1..test"
 
         mock_client = MagicMock()
@@ -1157,6 +1466,10 @@ class TestRecoveryTools:
     @patch("oracle.oci_recovery_mcp_server.server.get_tenancy")
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_summarize_backup_space_used(self, mock_get_client, mock_get_tenancy):
+        """
+        The space-used summary sums each protected database's backup space, falling
+        back to the metrics carried on the list summary.
+        """
         mock_get_tenancy.return_value = "ocid1.compartment.oc1..test"
 
         mock_client = MagicMock()
@@ -1219,6 +1532,10 @@ class TestRecoveryTools:
     async def test_check_recovery_service_limits(
         self, mock_get_limits_client, mock_load_config, mock_get_tenancy
     ):
+        """
+        The limits tool reports both Recovery Service limits, always scoped to the
+        tenancy OCID from config rather than to any compartment the caller passes.
+        """
         mock_get_tenancy.return_value = "ocid1.tenancy.oc1..tenancy"
         mock_load_config.return_value = {
             "region": "us-ashburn-1",
@@ -1265,6 +1582,7 @@ class TestRecoveryTools:
     @patch("oracle.oci_recovery_mcp_server.server._iam_subscribed_regions_with_status")
     @patch("oracle.oci_recovery_mcp_server.server.get_tenancy")
     async def test_fetch_regions_subscribed(self, mock_get_tenancy, mock_regions):
+        """The regions tool reports the tenancy's subscribed regions and their count."""
         mock_get_tenancy.return_value = "ocid1.tenancy.oc1..test"
         mock_regions.return_value = [
             {"region": "us-ashburn-1", "status": "READY"},
@@ -1282,6 +1600,10 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_monitoring_client")
     async def test_get_recovery_service_metrics(self, mock_get_monitoring_client):
+        """
+        The metrics tool returns one series per dimension set, each carrying its
+        aggregated datapoints as {timestamp, value} pairs.
+        """
         mock_client = MagicMock()
         mock_get_monitoring_client.return_value = mock_client
 
@@ -1306,7 +1628,7 @@ class TestRecoveryTools:
                     "metricName": "SpaceUsedForRecoveryWindow",
                     "resolution": "1m",
                     "aggregation": "mean",
-                    "protected_database_id": "pd1",
+                    "protected_database_id": "ocid1.protecteddatabase.oc1.iad.pd1",
                 },
             )
             result = call_tool_result.structured_content["result"]
@@ -1320,6 +1642,10 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_monitoring_client")
     async def test_get_recovery_service_metrics_no_pd_filter(self, mock_get_monitoring_client):
+        """
+        With no protected_database_id, the assembled query carries no resourceId filter
+        clause at all.
+        """
         mock_client = MagicMock()
         mock_get_monitoring_client.return_value = mock_client
 
@@ -1351,6 +1677,10 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_list_protected_databases_pagination(self, mock_get_client):
+        """
+        Listing follows the paging token until the service reports no next page,
+        returning the union of every page.
+        """
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -1388,6 +1718,10 @@ class TestRecoveryTools:
     async def test_list_protected_databases_dedup_child_compartments(
         self, mock_get_client, mock_comp_ids
     ):
+        """
+        A protected database visible from two compartments of a scanned subtree is
+        returned once.
+        """
         mock_comp_ids.return_value = ["comp1", "comp2"]
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
@@ -1422,6 +1756,10 @@ class TestRecoveryTools:
     async def test_summarize_health_alert_and_unknown_states(
         self, mock_get_client, mock_get_tenancy
     ):
+        """
+        A protected database with no health value counts as unknown rather than being
+        dropped from the total.
+        """
         mock_get_tenancy.return_value = "ocid1.compartment.oc1..test"
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
@@ -1462,6 +1800,10 @@ class TestRecoveryTools:
     async def test_summarize_redo_none_not_counted(
         self, mock_get_client, mock_get_tenancy
     ):
+        """
+        A protected database whose redo-shipped flag is None counts as neither enabled
+        nor disabled.
+        """
         mock_get_tenancy.return_value = "ocid1.compartment.oc1..test"
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
@@ -1488,7 +1830,9 @@ class TestRecoveryTools:
         agg = result["aggregated"]
         assert agg["enabled"] == 0
         assert agg["disabled"] == 0
-        assert agg["total"] == 0
+        assert agg["unknown"] == 1
+        # In scope but unreadable: it stays in total so the fleet size is right.
+        assert agg["total"] == 1
 
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_tenancy")
@@ -1538,6 +1882,10 @@ class TestRecoveryTools:
     async def test_summarize_backup_space_skips_deleted_lifecycle(
         self, mock_get_client, mock_get_tenancy
     ):
+        """
+        A deleted protected database is left out of the scan entirely -- not counted,
+        and never fetched.
+        """
         mock_get_tenancy.return_value = "ocid1.compartment.oc1..test"
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
@@ -1578,6 +1926,10 @@ class TestRecoveryTools:
     @pytest.mark.asyncio
     @patch("oracle.oci_recovery_mcp_server.server.get_recovery_client")
     async def test_list_protection_policies_with_lifecycle_filter(self, mock_get_client):
+        """
+        The lifecycle filter is forwarded to the SDK call rather than applied after the
+        fact.
+        """
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
@@ -1607,14 +1959,18 @@ class TestRecoveryTools:
 
 
 class TestServer:
+    """The entrypoint's transport selection and the validation guarding it."""
+
     @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
     @patch("os.getenv")
     def test_main_with_host_and_port_serves_http_behind_idcs_auth(
         self, mock_getenv, mock_mcp_run
     ):
-        # Host + port select the HTTP listener, and that listener is never started
-        # without an IAM auth provider attached: local profile credentials must not
-        # back a network listener.
+        """
+        Host plus port selects the HTTP listener, and that listener never starts
+        without an IAM auth provider attached: local profile credentials must not back
+        a network listener.
+        """
         mock_env = {
             "ORACLE_MCP_HOST": "127.0.0.1",
             "ORACLE_MCP_PORT": "8080",
@@ -1640,9 +1996,11 @@ class TestServer:
     def test_main_refuses_to_serve_http_without_an_auth_provider(
         self, mock_getenv, mock_mcp_run
     ):
-        # Fail closed: if the IDCS policy cannot be built (missing or malformed
-        # configuration), the listener must never start. Otherwise the operator's
-        # own OCI credentials would back an unauthenticated network listener.
+        """
+        The listener fails closed. If the IDCS policy cannot be built -- missing or
+        malformed configuration -- it never starts, rather than leaving the operator's
+        own OCI credentials backing an unauthenticated network listener.
+        """
         mock_env = {
             "ORACLE_MCP_HOST": "0.0.0.0",
             "ORACLE_MCP_PORT": "8080",
@@ -1666,6 +2024,7 @@ class TestServer:
     @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
     @patch("os.getenv")
     def test_main_without_host_and_port(self, mock_getenv, mock_mcp_run):
+        """With neither host nor port set, the server runs over stdio."""
         # Return None for host/port keys, otherwise pass through default (for log dir/file)
         mock_getenv.side_effect = lambda k, d=None: (
             None if k in ("ORACLE_MCP_HOST", "ORACLE_MCP_PORT") else d
@@ -1679,28 +2038,50 @@ class TestServer:
     @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
     @patch("os.getenv")
     def test_main_with_only_host(self, mock_getenv, mock_mcp_run):
+        """Host without port is rejected rather than half-configuring a listener."""
         mock_env = {"ORACLE_MCP_HOST": "127.0.0.1"}
         mock_getenv.side_effect = lambda k, d=None: mock_env.get(k, d)
 
         import oracle.oci_recovery_mcp_server.server as server
 
-        server.main()
-        mock_mcp_run.assert_called_once_with()
+        with pytest.raises(ValueError, match="must either both be set or both be unset"):
+            server.main()
+        mock_mcp_run.assert_not_called()
 
     @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
     @patch("os.getenv")
     def test_main_with_only_port(self, mock_getenv, mock_mcp_run):
+        """Port without host is rejected rather than half-configuring a listener."""
         mock_env = {"ORACLE_MCP_PORT": "8080"}
         mock_getenv.side_effect = lambda k, d=None: mock_env.get(k, d)
 
         import oracle.oci_recovery_mcp_server.server as server
 
-        server.main()
-        mock_mcp_run.assert_called_once_with()
+        with pytest.raises(ValueError, match="must either both be set or both be unset"):
+            server.main()
+        mock_mcp_run.assert_not_called()
+
+    @pytest.mark.parametrize("port", ["not-a-port", "0", "65536"])
+    @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
+    @patch("os.getenv")
+    def test_main_rejects_invalid_http_port(self, mock_getenv, mock_mcp_run, port):
+        """
+        A port that is not an integer from 1 to 65535 is rejected before the listener
+        starts.
+        """
+        mock_env = {"ORACLE_MCP_HOST": "127.0.0.1", "ORACLE_MCP_PORT": port}
+        mock_getenv.side_effect = lambda k, d=None: mock_env.get(k, d)
+
+        import oracle.oci_recovery_mcp_server.server as server
+
+        with pytest.raises(ValueError, match="integer from 1 to 65535"):
+            server.main()
+        mock_mcp_run.assert_not_called()
 
     @patch("oracle.oci_recovery_mcp_server.server.mcp.run")
     @patch("os.getenv")
     def test_main_http_honors_host_and_port(self, mock_getenv, mock_mcp_run):
+        """The configured host and port reach the HTTP transport as given."""
         mock_env = {
             "ORACLE_MCP_HOST": "0.0.0.0",
             "ORACLE_MCP_PORT": "9001",
@@ -1715,3 +2096,69 @@ class TestServer:
                 server.main()
         mock_mcp_run.assert_called_once_with(transport="http", host="0.0.0.0", port=9001)
         server._http_auth = None
+
+
+class TestToolContract:
+    """The tool surface a client sees before it calls anything."""
+
+    @pytest.mark.asyncio
+    async def test_every_tool_declares_itself_read_only(self):
+        """
+        Every tool declares itself read-only, non-destructive and idempotent, and only
+        the guidance tools declare that they never reach the network.
+
+        The server's central claim -- that it never creates, updates or deletes an OCI
+        resource -- is only in the README otherwise, where a host cannot act on it.
+        """
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+
+        assert len(tools) == 25
+        for tool in tools:
+            annotations = tool.annotations
+            assert annotations is not None, f"{tool.name} declares no annotations"
+            assert annotations.readOnlyHint is True, tool.name
+            assert annotations.destructiveHint is False, tool.name
+            assert annotations.idempotentHint is True, tool.name
+
+        # The guidance tools return static text and never reach the network.
+        local = {
+            "oci_recovery_service_dashboard_prompt",
+            "onboard_database_to_recovery_service",
+            "diagnose_recovery_service_issue",
+        }
+        for tool in tools:
+            expected = tool.name not in local
+            assert tool.annotations.openWorldHint is expected, tool.name
+
+    @pytest.mark.asyncio
+    async def test_summary_tools_advertise_the_shape_they_return(self, monkeypatch):
+        """
+        The two summary tools return exactly the keys their outputSchema declares.
+
+        Both once declared a counts model but returned a wrapper around it, so any
+        client trusting outputSchema was given the wrong contract.
+        """
+        recovery_client = MagicMock()
+        monkeypatch.setattr(
+            server, "get_recovery_client", lambda region=None, request_id=None: recovery_client
+        )
+        monkeypatch.setattr(
+            server, "_resolve_compartment_id", lambda compartment_id, **_kwargs: compartment_id
+        )
+        monkeypatch.setattr(server, "_compartment_ids_for_tool", lambda cid, **_kwargs: [cid])
+        recovery_client.list_protected_databases.return_value = SimpleNamespace(
+            data=SimpleNamespace(items=[]), has_next_page=False, next_page=None
+        )
+
+        async with Client(mcp) as client:
+            tools = {tool.name: tool for tool in await client.list_tools()}
+            for name in (
+                "summarize_protected_database_health",
+                "summarize_protected_database_redo_status",
+            ):
+                declared = set(tools[name].outputSchema["properties"])
+                result = await client.call_tool(
+                    name, {"compartment_id": "ocid1.compartment.oc1..c"}
+                )
+                assert set(result.structured_content) == declared, name

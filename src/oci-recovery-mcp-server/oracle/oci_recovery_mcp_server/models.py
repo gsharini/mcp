@@ -105,6 +105,14 @@ class ProtectedDatabaseHealthCounts(OCIBaseModel):
         ),
     )
     total: int = Field(0, alias="total", description="Total Protected Databases scanned.")
+    partial: bool = Field(
+        False,
+        alias="partial",
+        description=(
+            "True when the deadline stopped this scan part-way, so these counts cover only "
+            "some of the compartment's protected databases."
+        ),
+    )
 
 
 class ProtectedDatabaseRedoCounts(OCIBaseModel):
@@ -132,7 +140,87 @@ class ProtectedDatabaseRedoCounts(OCIBaseModel):
         alias="disabled",
         description="Count of Protected Databases with is_redo_logs_enabled = False.",
     )
-    total: int = Field(0, alias="total", description="Total counted (enabled + disabled).")
+    unknown: int = Field(
+        0,
+        alias="unknown",
+        description=(
+            "Count of Protected Databases whose redo status could not be read, for example "
+            "when the caller cannot GET the database. These are not counted as disabled."
+        ),
+    )
+    total: int = Field(
+        0,
+        alias="total",
+        description=(
+            "Total Protected Databases scanned (enabled + disabled + unknown). It answers "
+            "\"how many databases are in scope\", so the ones that could not be read are "
+            "included here and counted separately under unknown."
+        ),
+    )
+    partial: bool = Field(
+        False,
+        alias="partial",
+        description=(
+            "True when the deadline stopped this scan part-way, so these counts cover only "
+            "some of the compartment's protected databases."
+        ),
+    )
+
+
+class ProtectedDatabaseHealthSummary(OCIBaseModel):
+    """
+    What summarize_protected_database_health returns: tenancy-wide totals, the
+    same counts per compartment, and the compartments that were scanned.
+    """
+
+    aggregated: ProtectedDatabaseHealthCounts = Field(
+        ...,
+        alias="aggregated",
+        description="Counts summed across every compartment scanned.",
+    )
+    per_compartment: list[ProtectedDatabaseHealthCounts] = Field(
+        default_factory=list,
+        alias="per_compartment",
+        description="The same counts, one entry per compartment scanned.",
+    )
+    compartment_ids_scanned: list[str] = Field(
+        default_factory=list,
+        alias="compartmentIdsScanned",
+        description="OCIDs of the compartments included in this summary.",
+    )
+    truncated: bool = Field(
+        False,
+        alias="truncated",
+        description="True when the scan stopped early at its deadline, so counts are partial.",
+    )
+
+
+class ProtectedDatabaseRedoSummary(OCIBaseModel):
+    """
+    What summarize_protected_database_redo_status returns: tenancy-wide totals,
+    the same counts per compartment, and the compartments that were scanned.
+    """
+
+    aggregated: ProtectedDatabaseRedoCounts = Field(
+        ...,
+        alias="aggregated",
+        description="Counts summed across every compartment scanned.",
+    )
+    per_compartment: list[ProtectedDatabaseRedoCounts] = Field(
+        default_factory=list,
+        alias="per_compartment",
+        description="The same counts, one entry per compartment scanned.",
+    )
+    compartment_ids_scanned: list[str] = Field(
+        default_factory=list,
+        alias="compartmentIdsScanned",
+        description="OCIDs of the compartments included in this summary.",
+    )
+    truncated: bool = Field(
+        False,
+        alias="truncated",
+        description="True when the scan stopped early at its deadline, so counts are partial.",
+    )
 
 
 class ProtectedDatabaseBackupSpaceSum(OCIBaseModel):
@@ -480,6 +568,12 @@ def map_recovery_service_subnet(
             nsgs = None
 
     def _normalize_subnets(val):
+        """
+        Reduce a subnet list to plain OCID strings.
+
+        The service returns subnets either as bare OCIDs or as objects, and the key
+        naming inside those objects varies, so each known spelling is tried.
+        """
         if val is None:
             return None
         out = []
@@ -655,6 +749,13 @@ class ProtectedDatabaseSummary(OCIBaseModel):
 def map_protected_database_summary(
     pds: "oci.recovery.models.ProtectedDatabaseSummary",
 ) -> ProtectedDatabaseSummary | None:
+    """
+    Convert an oci.recovery.models.ProtectedDatabaseSummary to
+    oracle.oci_recovery_mcp_server.models.ProtectedDatabaseSummary.
+
+    An empty recovery_service_subnets list is kept distinct from a missing one,
+    since the two mean different things to the caller.
+    """
     if pds is None:
         return None
     data = _oci_to_dict(pds) or {}
@@ -735,6 +836,10 @@ class ProtectedDatabaseCollection(OCIBaseModel):
 def map_protected_database_collection(
     coll: "oci.recovery.models.ProtectedDatabaseCollection",
 ) -> ProtectedDatabaseCollection | None:
+    """
+    Convert an oci.recovery.models.ProtectedDatabaseCollection to
+    oracle.oci_recovery_mcp_server.models.ProtectedDatabaseCollection.
+    """
     if coll is None:
         return None
     data = _oci_to_dict(coll) or {}
@@ -774,6 +879,13 @@ class RecoveryServiceSubnetDetails(OCIBaseModel):
 def map_recovery_service_subnet_details(
     det: "oci.recovery.models.RecoveryServiceSubnetDetails",
 ) -> RecoveryServiceSubnetDetails | None:
+    """
+    Convert an oci.recovery.models.RecoveryServiceSubnetDetails to
+    oracle.oci_recovery_mcp_server.models.RecoveryServiceSubnetDetails.
+
+    Accepts a bare OCID string too, which is what some responses carry in place
+    of the full object.
+    """
     if det is None:
         return None
     data = _oci_to_dict(det) or {}
@@ -845,6 +957,10 @@ class RecoveryServiceSubnetInput(OCIBaseModel):
 def map_recovery_service_subnet_input(
     inp: "oci.recovery.models.RecoveryServiceSubnetInput",
 ) -> RecoveryServiceSubnetInput | None:
+    """
+    Convert an oci.recovery.models.RecoveryServiceSubnetInput to
+    oracle.oci_recovery_mcp_server.models.RecoveryServiceSubnetInput.
+    """
     if inp is None:
         return None
     data = _oci_to_dict(inp) or {}
@@ -896,6 +1012,10 @@ class RecoveryServiceSubnetSummary(OCIBaseModel):
 def map_recovery_service_subnet_summary(
     rss: "oci.recovery.models.RecoveryServiceSubnetSummary",
 ) -> RecoveryServiceSubnetSummary | None:
+    """
+    Convert an oci.recovery.models.RecoveryServiceSubnetSummary to
+    oracle.oci_recovery_mcp_server.models.RecoveryServiceSubnetSummary.
+    """
     if rss is None:
         return None
     data = _oci_to_dict(rss) or {}
@@ -945,6 +1065,10 @@ class RecoveryServiceSubnetCollection(OCIBaseModel):
 def map_recovery_service_subnet_collection(
     coll: "oci.recovery.models.RecoveryServiceSubnetCollection",
 ) -> RecoveryServiceSubnetCollection | None:
+    """
+    Convert an oci.recovery.models.RecoveryServiceSubnetCollection to
+    oracle.oci_recovery_mcp_server.models.RecoveryServiceSubnetCollection.
+    """
     if coll is None:
         return None
     data = _oci_to_dict(coll) or {}
@@ -1379,11 +1503,22 @@ class BackupDestinationDetails(OCIBaseModel):
 
 
 def map_backup_destination_details(det) -> BackupDestinationDetails | None:
+    """
+    Convert one OCI backup destination entry to BackupDestinationDetails.
+
+    The shape differs per destination kind (Object Storage bucket, NFS mount,
+    DBRS) and per SDK version, so each field is read through several candidate
+    names and anything unmodeled is kept in ``extras``.
+    """
     if not det:
         return None
     data = _oci_to_dict(det) or {}
 
     def pick(*names: str):
+        """
+        Return the first non-null value among several field names, by attribute
+        then by key.
+        """
         for n in names:
             v = getattr(det, n, None)
             if v is not None:
@@ -1490,11 +1625,21 @@ class DbBackupConfig(OCIBaseModel):
 
 
 def map_db_backup_config(cfg) -> DbBackupConfig | None:
+    """
+    Convert an OCI DbBackupConfig to oracle.oci_recovery_mcp_server.models.DbBackupConfig.
+
+    Field names vary across SDK versions and casings, so each is read through its
+    known spellings and anything unmodeled is kept in ``extras``.
+    """
     if not cfg:
         return None
     data = _oci_to_dict(cfg) or {}
 
     def pick(*names: str):
+        """
+        Return the first non-null value among several field names, by attribute
+        then by key.
+        """
         for n in names:
             v = getattr(cfg, n, None)
             if v is not None:
@@ -1602,6 +1747,10 @@ class Database(OCIBaseModel):
 
 
 def map_database(db) -> Database | None:
+    """
+    Convert an oci.database.models.Database to
+    oracle.oci_recovery_mcp_server.models.Database, including its backup config.
+    """
     if db is None:
         return None
     data = _oci_to_dict(db) or {}
@@ -1664,6 +1813,10 @@ class DatabaseSummary(OCIBaseModel):
 
 
 def map_database_summary(db) -> DatabaseSummary | None:
+    """
+    Convert an oci.database.models.DatabaseSummary to
+    oracle.oci_recovery_mcp_server.models.DatabaseSummary.
+    """
     if db is None:
         return None
     data = _oci_to_dict(db) or {}
@@ -1736,6 +1889,10 @@ class BackupSummary(OCIBaseModel):
 
 
 def map_backup_summary(b) -> BackupSummary | None:
+    """
+    Convert an oci.database.models.BackupSummary to
+    oracle.oci_recovery_mcp_server.models.BackupSummary.
+    """
     if b is None:
         return None
     data = _oci_to_dict(b) or {}
@@ -1810,6 +1967,10 @@ class Backup(OCIBaseModel):
 
 
 def map_backup(b) -> Backup | None:
+    """
+    Convert an oci.database.models.Backup to
+    oracle.oci_recovery_mcp_server.models.Backup.
+    """
     if b is None:
         return None
     data = _oci_to_dict(b) or {}
@@ -1868,6 +2029,13 @@ class WorkRequest(OCIBaseModel):
 
 
 def map_work_request(w) -> WorkRequest | None:
+    """
+    Convert an OCI work request to oracle.oci_recovery_mcp_server.models.WorkRequest.
+
+    Accepts work requests from either the Work Requests or Recovery service, whose
+    SDK objects do not always survive ``oci.util.to_dict``; the object's own
+    ``__dict__`` is used when it does not.
+    """
     if w is None:
         return None
     data = _oci_to_dict(w)
@@ -1913,6 +2081,10 @@ class DatabaseHomeSummary(OCIBaseModel):
 
 
 def map_database_home_summary(h) -> DatabaseHomeSummary | None:
+    """
+    Convert an oci.database.models.DbHomeSummary to
+    oracle.oci_recovery_mcp_server.models.DatabaseHomeSummary.
+    """
     if h is None:
         return None
     data = _oci_to_dict(h) or {}
@@ -1946,6 +2118,10 @@ class DatabaseHome(OCIBaseModel):
 
 
 def map_database_home(h) -> DatabaseHome | None:
+    """
+    Convert an oci.database.models.DbHome to
+    oracle.oci_recovery_mcp_server.models.DatabaseHome.
+    """
     if h is None:
         return None
     data = _oci_to_dict(h) or {}
@@ -1980,6 +2156,10 @@ class DbSystemSummary(OCIBaseModel):
 
 
 def map_db_system_summary(s) -> DbSystemSummary | None:
+    """
+    Convert an oci.database.models.DbSystemSummary to
+    oracle.oci_recovery_mcp_server.models.DbSystemSummary.
+    """
     if s is None:
         return None
     data = _oci_to_dict(s) or {}
@@ -2019,6 +2199,10 @@ class DbSystem(OCIBaseModel):
 
 
 def map_db_system(s) -> DbSystem | None:
+    """
+    Convert an oci.database.models.DbSystem to
+    oracle.oci_recovery_mcp_server.models.DbSystem.
+    """
     if s is None:
         return None
     data = _oci_to_dict(s) or {}
@@ -2050,6 +2234,10 @@ def map_db_system(s) -> DbSystem | None:
 
 
 class ProtectedDatabaseBackupDestinationItem(OCIBaseModel):
+    """
+    How one database is backed up, as reported by the backup destination summary.
+    """
+
     database_id: str = Field(..., description="Database OCID.")
     db_name: Optional[str] = Field(None, description="Database name.")
     status: Optional[str] = Field(None, description="CONFIGURED | HAS_BACKUPS | UNCONFIGURED")
@@ -2062,6 +2250,13 @@ class ProtectedDatabaseBackupDestinationItem(OCIBaseModel):
 
 
 class ProtectedDatabaseBackupDestinationSummary(OCIBaseModel):
+    """
+    Backup destination rollup for a compartment or DB Home.
+
+    Carries counts and name lists grouped by destination type, the databases with
+    no automatic backup configured, and the per-database detail behind them.
+    """
+
     compartment_id: Optional[str] = Field(None, description="Compartment OCID.")
     region: Optional[str] = Field(None, description="Region.")
     total_databases: int = Field(0, description="Total databases scanned.")

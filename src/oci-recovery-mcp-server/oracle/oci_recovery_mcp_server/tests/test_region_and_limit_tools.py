@@ -1,0 +1,168 @@
+"""
+Copyright (c) 2025, 2026 Oracle and/or its affiliates.
+Licensed under the Universal Permissive License v1.0 as shown at
+https://oss.oracle.com/licenses/upl.
+
+Tenancy region subscriptions and Recovery Service limit tools.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from _helpers import _raise, _response
+import oracle.oci_recovery_mcp_server.server as server
+
+
+def test_region_subscription_and_limit_tools_return_current_contracts(monkeypatch):
+    """
+    Subscribed regions are read through IAM, normalized across the snake_case and
+    camelCase attribute spellings, sorted, and cached so a second call does not
+    re-query. The limits tool then reports both Recovery Service limits for the
+    resolved region, reading them from an SDK object and a plain dict alike, and
+    passes the caller's opc_request_id through to every call.
+    """
+    region_cache = {"fetched_at": 0.0, "ttl_seconds": 3600, "items": {}}
+    monkeypatch.setattr(server, "_REGION_CACHE", region_cache)
+    monkeypatch.setattr(server, "get_tenancy", lambda: "tenancy")
+
+    identity_client = MagicMock()
+    identity_client.list_region_subscriptions.return_value = _response(
+        [
+            SimpleNamespace(region_name="us-phoenix-1", status="READY"),
+            SimpleNamespace(regionName="us-ashburn-1", status="READY"),
+            SimpleNamespace(status="IGNORED"),
+        ]
+    )
+    monkeypatch.setattr(
+        server, "get_identity_client", lambda request_id=None: identity_client
+    )
+
+    regions = server._iam_subscribed_regions_with_status(request_id="rid")
+    assert regions == [
+        {"region": "us-ashburn-1", "status": "READY"},
+        {"region": "us-phoenix-1", "status": "READY"},
+    ]
+    assert server._iam_subscribed_regions_with_status(request_id="rid2") == regions
+    identity_client.list_region_subscriptions.assert_called_once_with(
+        tenancy_id="tenancy"
+    )
+    assert server.fetch_regions_subscribed()["total"] == 2
+
+    limits_client = MagicMock()
+    monkeypatch.setattr(
+        server.oci.util,
+        "to_dict",
+        lambda _obj: _raise(RuntimeError("no SDK conversion")),
+    )
+    limits_client.get_resource_availability.side_effect = [
+        _response(
+            SimpleNamespace(
+                scope_type="REGION",
+                available=90,
+                used=10,
+                fractional_availability=0.9,
+                fractional_usage=0.1,
+                effective_quota_value=100,
+                policy_name="storage-policy",
+            )
+        ),
+        _response(
+            {
+                "scope_type": "AD",
+                "available": 4,
+                "used": 1,
+                "fractional_availability": 0.8,
+                "fractional_usage": 0.2,
+                "effective_quota_value": 5,
+                "policy_name": "count-policy",
+            }
+        ),
+    ]
+    monkeypatch.setattr(
+        server,
+        "_load_oci_config_for_server",
+        lambda: {"region": "us-phoenix-1"},
+    )
+    monkeypatch.setattr(
+        server,
+        "get_limits_client",
+        lambda region, request_id=None: limits_client,
+    )
+
+    limits = server.check_recovery_service_limits(
+        compartment_id="ignored",
+        region="ignored",
+        opc_request_id="opc",
+    )
+    assert limits["compartmentId"] == "tenancy"
+    assert limits["region"] == "us-phoenix-1"
+    assert limits["limits"]["protectedDatabaseBackupStorageGb"]["available"] == 90
+    assert limits["limits"]["protectedDatabaseCount"]["policyName"] == "count-policy"
+    assert [
+        call.kwargs["limit_name"]
+        for call in limits_client.get_resource_availability.call_args_list
+    ] == [
+        "protected-database-backup-storage-gb",
+        "protected-database-count",
+    ]
+    assert all(
+        call.kwargs["opc_request_id"] == "opc"
+        for call in limits_client.get_resource_availability.call_args_list
+    )
+
+
+def test_metric_query_parts_are_validated_before_interpolation(monkeypatch):
+    """
+    Every caller-supplied part of the MQL query is validated before it is
+    interpolated.
+
+    The query is assembled by string interpolation, so without this a caller could
+    reshape it or break out of the quoted resourceId filter, and an ordinary typo
+    would come back as an opaque service-side parse error.
+    """
+    captured = {}
+    monitoring_client = MagicMock()
+
+    def summarize(compartment_id, summarize_metrics_data_details):
+        """Capture the assembled query instead of calling Monitoring."""
+        captured["query"] = summarize_metrics_data_details.query
+        captured["resolution"] = summarize_metrics_data_details.resolution
+        return _response([])
+
+    monitoring_client.summarize_metrics_data.side_effect = summarize
+    monkeypatch.setattr(server, "get_monitoring_client", lambda **_kwargs: monitoring_client)
+    monkeypatch.setattr(server, "_compartment_ids_for_tool", lambda cid, **_kwargs: [cid])
+
+    valid = dict(
+        compartment_id="ocid1.compartment.oc1..c",
+        start_time="2026-01-01T00:00:00Z",
+        end_time="2026-01-02T00:00:00Z",
+    )
+
+    server.get_recovery_service_metrics(**valid)
+    assert captured["query"] == "SpaceUsedForRecoveryWindow[1h].max()"
+
+    server.get_recovery_service_metrics(
+        **valid,
+        metricName="ProtectedDatabaseSize",
+        resolution="1d",
+        aggregation="mean",
+        protected_database_id="ocid1.protecteddatabase.oc1.iad.abc123",
+    )
+    assert (
+        captured["query"]
+        == 'ProtectedDatabaseSize[1d]{resourceId="ocid1.protecteddatabase.oc1.iad.abc123"}.mean()'
+    )
+    assert captured["resolution"] == "1d"
+
+    rejected = {
+        "metricName": "CpuUtilization[1m].max() -- ",
+        "resolution": "99z",
+        "aggregation": "grouping(1)",
+        "protected_database_id": 'x"} or {resourceId=~".*"',
+    }
+    for field, value in rejected.items():
+        with pytest.raises(ValueError, match=field):
+            server.get_recovery_service_metrics(**valid, **{field: value})
